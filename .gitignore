@@ -1,55 +1,53 @@
-# Prerequisites
-*.d
-
-# Object files
+# Compilação (C/C++)
 *.o
-*.ko
-*.obj
-*.elf
-
-# Linker output
-*.ilk
-*.map
-*.exp
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Libraries
-*.lib
 *.a
-*.la
-*.lo
-
-# Shared objects (inc. Windows DLLs)
-*.dll
 *.so
 *.so.*
-*.dylib
-
-# Executables
-*.exe
 *.out
-*.app
-*.i*86
-*.x86_64
-*.hex
-
-# Debug files
-*.dSYM/
-*.su
-*.idb
+*.obj
+*.elf
+*.exp
 *.pdb
-
-# Kernel Module Compile Results
-*.mod*
+*.dSYM/
+*.map
+*.dwo
 *.cmd
+*.mod*
 .tmp_versions/
 modules.order
 Module.symvers
-Mkfile.old
-dkms.conf
 
-# debug information files
-*.dwo
+# Executáveis gerados pelo Makefile
+servidor
+tests/test_logic
+
+# Arquivos intermediários
+*.d
+*.su
+*.idb
+*.ilk
+*.pch
+*.gch
+*.lo
+*.la
+
+# Diretórios de build temporários
+build/
+dist/
+bin/
+obj/
+
+# Cache e temporários
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
+.vscode/*
