@@ -5,20 +5,21 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include "common.h"
 
 #define BUFFER_SIZE 1024
 
 int main(int argc, char *argv[]) {
 
     if (argc != 2) {
-       fprintf(stderr, "Use: ./servidor <porta>");
+        fprintf(stderr, "Use: ./servidor <porta>");
         return 1;
     }
 
     int port = atoi(argv[1]);
     int sockfd;
     struct sockaddr_in server_addr, client_addr;
-    char buffer[BUFFER_SIZE];
+    packet pkt;
 
     //cria socket UDP
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
@@ -46,12 +47,17 @@ int main(int argc, char *argv[]) {
     // recebendo mensagens
     while (1) {
         socklen_t len = sizeof(client_addr);
-        int n = recvfrom(sockfd, (char *)buffer, BUFFER_SIZE, MSG_WAITALL, (struct sockaddr *)&client_addr, &len);
+        int n = recvfrom(sockfd, &pkt, sizeof(pkt), 0, (struct sockaddr *)&client_addr, &len);
 
         if (n > 0) {
-            buffer[n] = '\0'; //tratar como string
-
-            printf("Mensagem recebida de %s:  %s\n", inet_ntoa(client_addr.sin_addr), buffer);
+            if (pkt.type == TYPE_DESCOBERTA) {
+                printf("Pedido de descoberta recebido de %s\n", inet_ntoa(client_addr.sin_addr));
+            
+                packet ack_pkt;
+                ack_pkt.type = TYPE_ACK_DESCOBERTA;
+                
+                sendto(sockfd, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
+            }
         }
     }
 

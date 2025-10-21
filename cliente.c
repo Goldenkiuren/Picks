@@ -5,8 +5,10 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <time.h>
+#include "common.h"
 
-#define SERVER_IP "127.0.0.1" //localhost
+#define BROADCAST_IP "255.255.255.255"
 
 int main(int argc, char *argv[]) {
     
@@ -17,8 +19,8 @@ int main(int argc, char *argv[]) {
 
     int port = atoi(argv[1]);
     int sockfd;
-    struct sockaddr_in servidor_addr;
-    const char *hello_message = "Olá, servidor! Sou o cliente.";
+    struct sockaddr_in server_addr, broadcast_addr;
+    packet discovery_pkt, response_pkt;
 
     //criando socket UDP
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
@@ -26,22 +28,48 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    memset(&servidor_addr, 0, sizeof(servidor_addr));
+    // habilita broadcast no socket
+    int broadcast_enable = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_BROADCAST, &broadcast_enable, sizeof(broadcast_enable)) < 0) {
+        perror("falha ao habilitar broadcast");
+        close(sockfd);
+        exit(EXIT_FAILURE);
+    }
 
-    servidor_addr.sin_family = AF_INET;
-    servidor_addr.sin_port = htons(port);
+    memset(&broadcast_addr, 0, sizeof(broadcast_addr));
 
-    // configurando o endereço do servidor
-    if (inet_aton(SERVER_IP, &servidor_addr.sin_addr) == 0) {
+    broadcast_addr.sin_family = AF_INET;
+    broadcast_addr.sin_port = htons(port);
+
+    // configurando o endereço do broadcast
+    if (inet_aton(BROADCAST_IP, &broadcast_addr.sin_addr) == 0) {
         fprintf(stderr, "Endereco IP invalido\n");
         exit(EXIT_FAILURE);
     }
 
-    // enviando mensagem
+    // prepara e envia o pacote de descoberta
+
+    discovery_pkt.type = TYPE_DESCOBERTA;
+    printf("Enviando pacote de descoberta... \n");
+    sendto(sockfd, &discovery_pkt, sizeof(packet), 0, (const struct sockaddr *)&broadcast_addr, sizeof(broadcast_addr));
+
+    printf("Aguardando resposta do servidor...\n");
+    socklen_t len = sizeof(server_addr);
+    int n = recvfrom(sockfd, &response_pkt, sizeof(packet), 0, (struct sockaddr *)&server_addr, &len);
+
+    // aguarda resposta do servidor
+
+    if (n > 0 && response_pkt.type == TYPE_ACK_DESCOBERTA)  {
+        char time_buffer[100];
+        time_t now = time(0);
+        struct tm *t = localtime(&now);
+        strftime(time_buffer, sizeof(time_buffer), "%Y-%m-%d %H:%M:%S", t);
+
+        printf("%s server_addr %s\n", time_buffer, inet_ntoa(server_addr.sin_addr));
+    } else {
+        printf("Nenhuma resposta do servidor recebida.\n");
+    }
     
-    sendto(sockfd, hello_message, strlen(hello_message), 0, (const struct sockaddr *)&servidor_addr, sizeof(servidor_addr));
-    
-    printf("Mensagem enviada para o servidor.\n");
 
     close(sockfd);
     return 0;
