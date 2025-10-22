@@ -78,7 +78,7 @@ int main(int argc, char *argv[]) {
             req_pkt.type = TYPE_REQ;
             req_pkt.seqn = seqn_local;
             req_pkt.value = valor;
-            req_pkt.dest_addr = inet_addr(ip_str); 
+            inet_aton(ip_str, &req_pkt.dest_addr); 
 
             //envia requisicao
             sendto(sockfd, &req_pkt, sizeof(packet), 0, (const struct sockaddr *)&server_addr, sizeof(server_addr));
