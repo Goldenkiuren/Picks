@@ -48,7 +48,6 @@ int main(int argc, char *argv[]) {
     }
 
     // prepara e envia o pacote de descoberta
-
     discovery_pkt.type = TYPE_DESCOBERTA;
     printf("Enviando pacote de descoberta... \n");
     sendto(sockfd, &discovery_pkt, sizeof(packet), 0, (const struct sockaddr *)&broadcast_addr, sizeof(broadcast_addr));
@@ -58,7 +57,6 @@ int main(int argc, char *argv[]) {
     int n = recvfrom(sockfd, &response_pkt, sizeof(packet), 0, (struct sockaddr *)&server_addr, &len);
 
     // aguarda resposta do servidor
-
     if (n > 0 && response_pkt.type == TYPE_ACK_DESCOBERTA)  {
         char time_buffer[100];
         time_t now = time(0);
@@ -66,6 +64,40 @@ int main(int argc, char *argv[]) {
         strftime(time_buffer, sizeof(time_buffer), "%Y-%m-%d %H:%M:%S", t);
 
         printf("%s server_addr %s\n", time_buffer, inet_ntoa(server_addr.sin_addr));
+
+        uint32_t seqn_local = 0;
+        char ip_str[20];
+        uint32_t valor;
+
+        // loop de leitura de comandos
+        while (scanf("%s %u", ip_str, &valor) == 2) {
+            seqn_local++;
+
+            //pacote de requisicao
+            packet req_pkt;
+            req_pkt.type = TYPE_REQ;
+            req_pkt.seqn = seqn_local;
+            req_pkt.value = valor;
+            req_pkt.dest_addr = inet_addr(ip_str); 
+
+            //envia requisicao
+            sendto(sockfd, &req_pkt, sizeof(packet), 0, (const struct sockaddr *)&server_addr, sizeof(server_addr));
+
+            //aguarda resposta
+            packet ack_pkt;
+            n = recvfrom(sockfd, &ack_pkt, sizeof(packet), 0, NULL, NULL);
+            if (n > 0 && ack_pkt.type == TYPE_ACK_REQ) {
+                now = time(0);
+                t = localtime(&now);
+                strftime(time_buffer, sizeof(time_buffer), "%Y-%m-%d %H:%M:%S", t);
+
+                // imprime resultado
+                printf("%s server %s id req %u dest %s value %u new_balance %u\n", time_buffer, inet_ntoa(server_addr.sin_addr), ack_pkt.seqn, ip_str, valor, ack_pkt.balance);
+            } else {
+                // timeouts e retransmissao
+                fprintf(stderr, "Erro: ACK não recebido ou pacote inválido.\n");
+            }
+        }
     } else {
         printf("Nenhuma resposta do servidor recebida.\n");
     }
