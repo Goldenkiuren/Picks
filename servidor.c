@@ -51,7 +51,7 @@ int register_new_client(struct sockaddr_in* cliaddr) {
         num_clients++;
         total_balance += INITIAL_BALANCE;
 
-        printf("Novo cliente registrado: %s | Saldo: %d | Total Clientes: %d | Saldo Banco: %d\n", inet_ntoa(cliaddr->sin_addr), INITIAL_BALANCE, num_clients, total_balance);
+        printf("Novo cliente registrado: %s | Saldo: %d | Total Clientes: %d | Saldo Banco: %u\n", inet_ntoa(cliaddr->sin_addr), INITIAL_BALANCE, num_clients, total_balance);
         return new_client_id;
     }
 
@@ -105,7 +105,7 @@ int main(int argc, char *argv[]) {
 
         if (n > 0) {
             //lógica de descoberta
-            if (pkt.type == TYPE_DESCOBERTA) {
+            if (ntohs(pkt.type) == TYPE_DESCOBERTA) {
                 printf("Pedido de descoberta recebido de %s\n", inet_ntoa(client_addr.sin_addr));
 
                 //verifica se o cliente já existe, se não registra
@@ -115,56 +115,85 @@ int main(int argc, char *argv[]) {
                 }
 
                 packet ack_pkt;
-                ack_pkt.type = TYPE_ACK_DESCOBERTA;
+                memset(&ack_pkt, 0, sizeof(packet));
+                ack_pkt.type = htons(TYPE_ACK_DESCOBERTA);
                 sendto(sockfd, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);                
             }
 
-            else if (pkt.type == TYPE_REQ) {
+            else if (ntohs(pkt.type) == TYPE_REQ) {
+                uint32_t seqn = ntohl(pkt.seqn);
+                uint32_t value = ntohl(pkt.value);
+
                 int origin_idx = find_client(&client_addr);
                 int dest_idx = find_client_ip(pkt.dest_addr);
 
-                int32_t new_balance = -1; //saldo a ser retornado
-
-                //verifica se a origem e o destino existem
-                if (origin_idx != -1 && dest_idx != -1) {
-                    if (client_table[origin_idx].balance >= pkt.value) {
-                        client_table[origin_idx].balance -= pkt.value; //debita da origem
-                        client_table[dest_idx].balance += pkt.value; //credita no destino
-                        
-                        client_table[origin_idx].last_req = pkt.seqn; // atualiza ultimo id
-                    
-                        new_balance = client_table[origin_idx].balance;
-
-                        //atualiza servidor
-                        num_transactions++;
-                        total_transferred += pkt.value;
-                    } else {
-                        //saldo insuficiente
-                        printf("Saldo insuficiente para cliente %s\n", inet_ntoa(client_addr.sin_addr));
-                        new_balance = client_table[origin_idx].balance; //saldo atual
-                    }
-                } else {
-                    // cliente origem ou destino não encontrado
-                    printf("Cliente de origem ou destino não encontrado.\n");
-                    if(origin_idx != -1) { new_balance = client_table[origin_idx].balance; }
+                //envio de erro se origem ou destino não encontrados
+                if (origin_idx == -1) {
+                    printf("Cliente de origem não encontrado: %s\n", inet_ntoa(client_addr.sin_addr));
+                    packet error_pkt;
+                    memset(&error_pkt, 0, sizeof(packet));
+                    error_pkt.type = htons(TYPE_ERROR_REQ);
+                    sendto(sockfd, &error_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
+                    continue;
                 }
+
+                if (dest_idx == -1) {
+                    printf("Cliente de destino não encontrado: %s\n", inet_ntoa(pkt.dest_addr));
+                    packet error_pkt;
+                    memset(&error_pkt, 0, sizeof(packet));
+                    error_pkt.type = htons(TYPE_ERROR_REQ);
+                    sendto(sockfd, &error_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
+                    continue;
+                }
+
+                uint32_t new_balance = client_table[origin_idx].balance; 
+                
+                //verifica se o saldo é o suficiente
+                if (client_table[origin_idx].balance >= value) {
+                    client_table[origin_idx].balance -= value; //debita da origem
+                    client_table[dest_idx].balance += value; //credita no destino
+
+                    client_table[origin_idx].last_req = seqn; //atualiza ultimo id
+
+                    new_balance = client_table[origin_idx].balance;
+
+                    //atualiza servidor
+                    num_transactions++;
+                    total_transferred += value;
+                } else {
+                    //saldo insuficiente
+                    printf("Saldo insuficiente para cliente %s (saldo: %u, value: %u)\n", inet_ntoa(client_addr.sin_addr), client_table[origin_idx].balance, value);
+                }
+
+                
                 //envia resposta ack
                 packet ack_pkt;
-                ack_pkt.type = TYPE_ACK_REQ;
-                ack_pkt.balance = new_balance;
-                ack_pkt.seqn = pkt.seqn; //ack do número de sequencia recebido
+                memset(&ack_pkt, 0, sizeof(packet));
+                ack_pkt.type = htons(TYPE_ACK_REQ);
+                ack_pkt.balance = htonl(new_balance);
+                ack_pkt.seqn = htonl(seqn); //ack do número de sequencia recebido
                 sendto(sockfd, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
 
+                char ip_origin[INET_ADDRSTRLEN];
+                char ip_dest[INET_ADDRSTRLEN];
+                strcpy(ip_origin, inet_ntoa(client_addr.sin_addr));
+                strcpy(ip_dest, inet_ntoa(pkt.dest_addr));
                 get_current_time(time_str, sizeof(time_str));
                 printf("%s client %s id_req %u dest %s value %u num_transactions %u total_transferred %u total_balance %u\n",
                     time_str,
-                    inet_ntoa(client_addr.sin_addr), // IP Origem 
-                    pkt.seqn, 
-                    inet_ntoa(pkt.dest_addr), // IP Destino 
-                    pkt.value, 
+                    ip_origin, 
+                    seqn, 
+                    ip_dest, 
+                    value, 
                     num_transactions, 
                     total_transferred,  
                     total_balance);
+            }
+            else if(ntohs(pkt.type) == TYPE_ERROR_REQ) {
+                printf("Pacote de erro recebido de %s (ignorado)\n", inet_ntoa(client_addr.sin_addr));
+            }
+            else {
+                printf("Tipo de pacote desconhecido (%d) de %s\n", ntohs(pkt.type), inet_ntoa(client_addr.sin_addr));
             }
         }
     }

@@ -48,7 +48,8 @@ int main(int argc, char *argv[]) {
     }
 
     // prepara e envia o pacote de descoberta
-    discovery_pkt.type = TYPE_DESCOBERTA;
+    memset(&discovery_pkt, 0, sizeof(packet));
+    discovery_pkt.type = htons(TYPE_DESCOBERTA);
     printf("Enviando pacote de descoberta... \n");
     sendto(sockfd, &discovery_pkt, sizeof(packet), 0, (const struct sockaddr *)&broadcast_addr, sizeof(broadcast_addr));
 
@@ -57,7 +58,7 @@ int main(int argc, char *argv[]) {
     int n = recvfrom(sockfd, &response_pkt, sizeof(packet), 0, (struct sockaddr *)&server_addr, &len);
 
     // aguarda resposta do servidor
-    if (n > 0 && response_pkt.type == TYPE_ACK_DESCOBERTA)  {
+    if (n > 0 && ntohs(response_pkt.type) == TYPE_ACK_DESCOBERTA)  {
         char time_buffer[100];
         time_t now = time(0);
         struct tm *t = localtime(&now);
@@ -71,13 +72,22 @@ int main(int argc, char *argv[]) {
 
         // loop de leitura de comandos
         while (scanf("%s %u", ip_str, &valor) == 2) {
+            
+            //validacao de ip
+            struct in_addr temp_addr;
+            if (inet_aton(ip_str, &temp_addr) == 0) {
+                fprintf(stderr, "IP inválido: %s\n", ip_str);
+                continue;
+            }
+            
             seqn_local++;
 
             //pacote de requisicao
             packet req_pkt;
-            req_pkt.type = TYPE_REQ;
-            req_pkt.seqn = seqn_local;
-            req_pkt.value = valor;
+            memset(&req_pkt, 0, sizeof(packet));
+            req_pkt.type = htons(TYPE_REQ);
+            req_pkt.seqn = htonl(seqn_local);
+            req_pkt.value = htonl(valor);
             inet_aton(ip_str, &req_pkt.dest_addr); 
 
             //envia requisicao
