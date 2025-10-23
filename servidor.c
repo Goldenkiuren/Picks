@@ -6,6 +6,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <time.h>
+#include <pthread.h>
+#include <stdbool.h>
 #include "common.h"
 
 #define BUFFER_SIZE 1024
@@ -18,6 +20,7 @@ int num_clients = 0;
 uint32_t num_transactions = 0;
 uint32_t total_transferred = 0;
 uint32_t total_balance = 0;
+pthread_mutex_t global_mutex;
 
 //encontra o indice de um cliente na tabela pelo seu endereco
 int find_client(struct sockaddr_in* cliaddr) {
@@ -64,6 +67,139 @@ void get_current_time(char* buffer, size_t buffer_size) {
     strftime(buffer, buffer_size, "%Y-%m-%d %H:%M:%S", t);
 }
 
+
+
+//estrutura para passar dados para a thread
+typedef struct {
+    packet pkt;
+    struct sockaddr_in client_addr;
+    socklen_t len;
+    int sockfd;
+} request_data;
+
+
+//função executada por nova thread
+void* process_request(void* arg) {
+
+    //recupera os dados da requisicao
+    request_data* data = (request_data*)arg;
+    packet pkt = data->pkt;
+    struct sockaddr_in client_addr = data->client_addr;
+    int sockfd = data->sockfd;
+    socklen_t len = data->len;
+    
+    //lógica de processamento 
+    pthread_mutex_lock(&global_mutex);
+    
+    //lógica de descoberta
+    if (ntohs(pkt.type) == TYPE_DESCOBERTA) {
+        printf("Pedido de descoberta recebido de %s\n", inet_ntoa(client_addr.sin_addr));
+
+        int client_idx = find_client(&client_addr);
+        if (client_idx == -1) {
+            register_new_client(&client_addr);
+        }
+
+        packet ack_pkt;
+        memset(&ack_pkt, 0, sizeof(packet));
+        ack_pkt.type = htons(TYPE_ACK_DESCOBERTA);
+        sendto(sockfd, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);                
+    }
+    
+    //lógica de requisição
+    else if (ntohs(pkt.type) == TYPE_REQ) {
+        uint32_t seqn = ntohl(pkt.seqn);
+        uint32_t value = ntohl(pkt.value);
+
+        int origin_idx = find_client(&client_addr);
+        int dest_idx = find_client_ip(pkt.dest_addr);
+        
+        uint32_t new_balance = 0;
+        
+        bool send_ack = true; //controlar envio de ack e error
+        
+        if (origin_idx == -1) {
+            printf("Cliente de origem não encontrado: %s\n", inet_ntoa(client_addr.sin_addr));
+            packet error_pkt;
+            memset(&error_pkt, 0, sizeof(packet));
+            error_pkt.type = htons(TYPE_ERROR_REQ);
+            sendto(sockfd, &error_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
+            
+        } else if (dest_idx == -1) {
+            printf("Cliente de destino não encontrado: %s\n", inet_ntoa(pkt.dest_addr));
+            packet error_pkt;
+            memset(&error_pkt, 0, sizeof(packet));
+            error_pkt.type = htons(TYPE_ERROR_REQ);
+            sendto(sockfd, &error_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
+        } else {
+            //se origem e destino existem processa
+            new_balance = (uint32_t)client_table[origin_idx].balance;
+            
+            //nao aceita auto-transferência
+            if (origin_idx == dest_idx) {
+                 printf("Erro: Cliente %s tentando transferir para si mesmo.\n", inet_ntoa(client_addr.sin_addr));
+                 send_ack = false;
+                 packet error_pkt;
+                 memset(&error_pkt, 0, sizeof(packet));
+                 error_pkt.type = htons(TYPE_ERROR_REQ);
+                 sendto(sockfd, &error_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
+            }
+            
+            // Verifica saldo
+            else if (client_table[origin_idx].balance >= (int32_t)value) {
+                client_table[origin_idx].balance -= (int32_t)value;
+                client_table[dest_idx].balance += (int32_t)value;
+                client_table[origin_idx].last_req = seqn;
+                new_balance = (uint32_t)client_table[origin_idx].balance;
+
+                num_transactions++;
+                total_transferred += value;
+                
+                char time_str[100];
+                char ip_origin[INET_ADDRSTRLEN];
+                char ip_dest[INET_ADDRSTRLEN];
+                strcpy(ip_origin, inet_ntoa(client_addr.sin_addr));
+                strcpy(ip_dest, inet_ntoa(pkt.dest_addr));
+                get_current_time(time_str, sizeof(time_str));
+                printf("%s client %s id_req %u dest %s value %u num_transactions %u total_transferred %u total_balance %u\n",
+                    time_str, ip_origin, seqn, ip_dest, value, 
+                    num_transactions, total_transferred, total_balance);
+            
+            } else {
+                printf("Saldo insuficiente para cliente %s (saldo: %d, value: %u)\n", 
+                       inet_ntoa(client_addr.sin_addr), client_table[origin_idx].balance, value);
+            }
+            
+            //envia resposta ack se nao houve erros
+            if (send_ack) {
+                packet ack_pkt;
+                memset(&ack_pkt, 0, sizeof(packet));
+                ack_pkt.type = htons(TYPE_ACK_REQ);
+                ack_pkt.balance = htonl(new_balance);
+                ack_pkt.seqn = htonl(seqn);
+                sendto(sockfd, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
+            }
+        }
+    }
+    
+    //tratamento para outros types
+    else if(ntohs(pkt.type) == TYPE_ERROR_REQ) {
+        printf("Pacote de erro recebido de %s (ignorado)\n", inet_ntoa(client_addr.sin_addr));
+    }
+    else {
+        printf("Tipo de pacote desconhecido (%d) de %s\n", ntohs(pkt.type), inet_ntoa(client_addr.sin_addr));
+    }
+    
+    pthread_mutex_unlock(&global_mutex);
+    
+    free(arg);
+    return NULL;
+            
+            
+}
+
+
+
 int main(int argc, char *argv[]) {
     if (argc != 2) {
         fprintf(stderr, "Uso: ./servidor <porta>\n");
@@ -72,16 +208,21 @@ int main(int argc, char *argv[]) {
 
     int port = atoi(argv[1]);
     int sockfd;
-    struct sockaddr_in server_addr, client_addr;
-    packet pkt;
+    struct sockaddr_in server_addr;
+    
+    if (pthread_mutex_init(&global_mutex, NULL) != 0) {
+        perror("falha ao inicializar mutex.\n");
+        exit(EXIT_FAILURE);
+    }
 
     // setup
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         perror("falha em criar o socket");
         exit(EXIT_FAILURE);
     }
+    
+    
     memset(&server_addr, 0, sizeof(server_addr));
-    memset(&client_addr, 0, sizeof(client_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(port);
@@ -90,7 +231,7 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
     
-
+    //log inicial
     char time_str[100];
     get_current_time(time_str, sizeof(time_str));
     printf("%s num_transactions %u total_transferred %u total_balance %u\n", time_str, num_transactions, total_transferred, total_balance);
@@ -98,104 +239,39 @@ int main(int argc, char *argv[]) {
 
 
     while(1) {
-        socklen_t len = sizeof(client_addr);
-        int n = recvfrom(sockfd, &pkt, sizeof(packet), 0, (struct sockaddr *)&client_addr, &len);
+        struct sockaddr_in client_addr_temp;
+        packet pkt_temp;
         
-
-        if (n > 0) {
-            //lógica de descoberta
-            if (ntohs(pkt.type) == TYPE_DESCOBERTA) {  // Network to Host
-                printf("Pedido de descoberta recebido de %s\n", inet_ntoa(client_addr.sin_addr));
-
-                //verifica se o cliente já existe, se não registra
-                int client_idx = find_client(&client_addr);
-                if (client_idx == -1) {
-                    register_new_client(&client_addr);
-                }
-
-                packet ack_pkt;
-                memset(&ack_pkt, 0, sizeof(packet));  // Inicializa
-                ack_pkt.type = htons(TYPE_ACK_DESCOBERTA);  // Host to Network
-                sendto(sockfd, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);                
+        socklen_t len = sizeof(client_addr_temp);
+        int n = recvfrom(sockfd, &pkt_temp, sizeof(packet), 0, (struct sockaddr *)&client_addr_temp, &len);
+        
+        if (n>0) {
+            //alocar memoria no heap para os dados da requisicao
+            request_data* data = (request_data*)malloc(sizeof(request_data));
+            if (data == NULL) {
+                perror("falha ao alocar memória para thread.\n");
+                continue;
             }
-
-            else if (ntohs(pkt.type) == TYPE_REQ) {  // Network to Host
-                uint32_t seqn = ntohl(pkt.seqn);  // Network to Host
-                uint32_t value = ntohl(pkt.value);  // Network to Host
-
-                int origin_idx = find_client(&client_addr);
-                int dest_idx = find_client_ip(pkt.dest_addr);
-
-                //envio de erro se origem ou destino não encontrados
-                if (origin_idx == -1) {
-                    printf("Cliente de origem não encontrado: %s\n", inet_ntoa(client_addr.sin_addr));
-                    packet error_pkt;
-                    memset(&error_pkt, 0, sizeof(packet));
-                    error_pkt.type = htons(TYPE_ERROR_REQ);  // Host to Network
-                    sendto(sockfd, &error_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
-                    continue;
-                }
-
-                if (dest_idx == -1) {
-                    printf("Cliente de destino não encontrado: %s\n", inet_ntoa(pkt.dest_addr));
-                    packet error_pkt;
-                    memset(&error_pkt, 0, sizeof(packet));
-                    error_pkt.type = htons(TYPE_ERROR_REQ);  // Host to Network
-                    sendto(sockfd, &error_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
-                    continue;
-                }
-
-                uint32_t new_balance = (uint32_t)client_table[origin_idx].balance;  // Cast pra unsigned pro pacote
-                
-                //verifica se o saldo é suficiente
-                if (client_table[origin_idx].balance >= (int32_t)value) {
-                    client_table[origin_idx].balance -= (int32_t)value; //debita da origem
-                    client_table[dest_idx].balance += (int32_t)value; //credita no destino
-                    
-                    client_table[origin_idx].last_req = seqn; // atualiza ultimo id
-                
-                    new_balance = (uint32_t)client_table[origin_idx].balance;
-
-                    //atualiza servidor
-                    num_transactions++;
-                    total_transferred += value;
-                } else {
-                    //saldo insuficiente - CORRIGIDO: %d pro balance (int32_t signed)
-                    printf("Saldo insuficiente para cliente %s (saldo: %d, value: %u)\n", inet_ntoa(client_addr.sin_addr), client_table[origin_idx].balance, value);
-                }
-                //envia resposta ack
-                packet ack_pkt;
-                memset(&ack_pkt, 0, sizeof(packet));  // Inicializa
-                ack_pkt.type = htons(TYPE_ACK_REQ);  // Host to Network
-                ack_pkt.balance = htonl(new_balance);  // Host to Network
-                ack_pkt.seqn = htonl(seqn);  // Host to Network (usando o convertido)
-                sendto(sockfd, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
-
-                char ip_origin[INET_ADDRSTRLEN];
-                char ip_dest[INET_ADDRSTRLEN];
-                strcpy(ip_origin, inet_ntoa(client_addr.sin_addr));
-                strcpy(ip_dest, inet_ntoa(pkt.dest_addr));
-                get_current_time(time_str, sizeof(time_str));
-                printf("%s client %s id_req %u dest %s value %u num_transactions %u total_transferred %u total_balance %u\n",
-                    time_str,
-                    ip_origin, 
-                    seqn, 
-                    ip_dest, 
-                    value, 
-                    num_transactions, 
-                    total_transferred,  
-                    total_balance);
+            
+            //copiar dados para a struct alocada
+            data->pkt = pkt_temp;
+            data->client_addr = client_addr_temp;
+            data->len = len;
+            data->sockfd = sockfd;
+            
+            //thread para processar requisicao
+            pthread_t thread_id;
+            if (pthread_create(&thread_id, NULL, process_request, (void*)data) != 0) {
+                perror("falha ao criar thread");
+                free(data); // Libera memória se a thread não foi criada
             }
-            else if(ntohs(pkt.type) == TYPE_ERROR_REQ) {
-                printf("Pacote de erro recebido de %s (ignorado)\n", inet_ntoa(client_addr.sin_addr));
-            }
-            else {
-                printf("Tipo de pacote desconhecido (%d) de %s\n", ntohs(pkt.type), inet_ntoa(client_addr.sin_addr));
-            }
+            
+            pthread_detach(thread_id);
         }
     }
 
     close(sockfd);
+    pthread_mutex_destroy(&global_mutex);
     return 0;
 
 }
