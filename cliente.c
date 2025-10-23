@@ -6,6 +6,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <time.h>
+#include <sys/select.h>  // FIX: Adicionado pra timeout com select
 #include "common.h"
 
 #define BROADCAST_IP "255.255.255.255"
@@ -48,8 +49,8 @@ int main(int argc, char *argv[]) {
     }
 
     // prepara e envia o pacote de descoberta
-    memset(&discovery_pkt, 0, sizeof(packet));
-    discovery_pkt.type = htons(TYPE_DESCOBERTA);
+    memset(&discovery_pkt, 0, sizeof(packet));  // Inicializa pra evitar lixo
+    discovery_pkt.type = htons(TYPE_DESCOBERTA);  // Host to Network
     printf("Enviando pacote de descoberta... \n");
     sendto(sockfd, &discovery_pkt, sizeof(packet), 0, (const struct sockaddr *)&broadcast_addr, sizeof(broadcast_addr));
 
@@ -57,7 +58,7 @@ int main(int argc, char *argv[]) {
     socklen_t len = sizeof(server_addr);
     int n = recvfrom(sockfd, &response_pkt, sizeof(packet), 0, (struct sockaddr *)&server_addr, &len);
 
-    // aguarda resposta do servidor
+    // aguarda resposta do servidor - JÁ CORRIGIDO: ntohs pro type (evita 2 virar 512)
     if (n > 0 && ntohs(response_pkt.type) == TYPE_ACK_DESCOBERTA)  {
         char time_buffer[100];
         time_t now = time(0);
@@ -72,20 +73,19 @@ int main(int argc, char *argv[]) {
 
         // loop de leitura de comandos
         while (scanf("%s %u", ip_str, &valor) == 2) {
-            
-            //validacao de ip
+            // Validação de IP
             struct in_addr temp_addr;
             if (inet_aton(ip_str, &temp_addr) == 0) {
                 fprintf(stderr, "IP inválido: %s\n", ip_str);
                 continue;
             }
-            
+
             seqn_local++;
 
             //pacote de requisicao
             packet req_pkt;
-            memset(&req_pkt, 0, sizeof(packet));
-            req_pkt.type = htons(TYPE_REQ);
+            memset(&req_pkt, 0, sizeof(packet));  // Inicializa
+            req_pkt.type = htons(TYPE_REQ);  // Host to Network
             req_pkt.seqn = htonl(seqn_local);
             req_pkt.value = htonl(valor);
             inet_aton(ip_str, &req_pkt.dest_addr); 
@@ -93,19 +93,33 @@ int main(int argc, char *argv[]) {
             //envia requisicao
             sendto(sockfd, &req_pkt, sizeof(packet), 0, (const struct sockaddr *)&server_addr, sizeof(server_addr));
 
-            //aguarda resposta
+            //aguarda resposta - COM TIMEOUT
             packet ack_pkt;
-            n = recvfrom(sockfd, &ack_pkt, sizeof(packet), 0, NULL, NULL);
-            if (n > 0 && ack_pkt.type == TYPE_ACK_REQ) {
-                now = time(0);
-                t = localtime(&now);
-                strftime(time_buffer, sizeof(time_buffer), "%Y-%m-%d %H:%M:%S", t);
+            struct timeval timeout;
+            timeout.tv_sec = 5;  // 5s timeout
+            timeout.tv_usec = 0;
+            fd_set readfds;
+            FD_ZERO(&readfds);
+            FD_SET(sockfd, &readfds);
+            int ready = select(sockfd + 1, &readfds, NULL, NULL, &timeout);
+            if (ready > 0) {
+                n = recvfrom(sockfd, &ack_pkt, sizeof(packet), 0, NULL, NULL);
+                // JÁ CORRIGIDO: ntohs/ntohl pro type, seqn e balance (evita valores gigantes como 1024 ou 16777216)
+                if (n > 0 && ntohs(ack_pkt.type) == TYPE_ACK_REQ && ntohl(ack_pkt.seqn) == seqn_local) {
+                    now = time(0);
+                    t = localtime(&now);
+                    strftime(time_buffer, sizeof(time_buffer), "%Y-%m-%d %H:%M:%S", t);
 
-                // imprime resultado
-                printf("%s server %s id req %u dest %s value %u new_balance %u\n", time_buffer, inet_ntoa(server_addr.sin_addr), ack_pkt.seqn, ip_str, valor, ack_pkt.balance);
+                    // imprime resultado - JÁ CORRIGIDO: ntohl pro balance (e seqn_local pro id req)
+                    printf("%s server %s id req %u dest %s value %u new_balance %u\n", time_buffer, inet_ntoa(server_addr.sin_addr), seqn_local, ip_str, valor, ntohl(ack_pkt.balance));
+                } else if (ntohs(ack_pkt.type) == TYPE_ERROR_REQ) {  // ADICIONADO: Tratamento pro erro do servidor
+                    fprintf(stderr, "Erro no servidor: Requisição inválida (ex.: cliente destino não encontrado).\n");
+                } else {
+                    // timeouts e retransmissao
+                    fprintf(stderr, "Erro: ACK não recebido ou pacote inválido (type: %d, seqn: %u vs esperado %u).\n", ntohs(ack_pkt.type), ntohl(ack_pkt.seqn), seqn_local);
+                }
             } else {
-                // timeouts e retransmissao
-                fprintf(stderr, "Erro: ACK não recebido ou pacote inválido.\n");
+                fprintf(stderr, "Timeout na recepção de ACK. Pacote perdido.\n");
             }
         }
     } else {

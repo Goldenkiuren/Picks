@@ -5,7 +5,6 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <pthread.h>
 #include <time.h>
 #include "common.h"
 
@@ -105,7 +104,7 @@ int main(int argc, char *argv[]) {
 
         if (n > 0) {
             //lógica de descoberta
-            if (ntohs(pkt.type) == TYPE_DESCOBERTA) {
+            if (ntohs(pkt.type) == TYPE_DESCOBERTA) {  // Network to Host
                 printf("Pedido de descoberta recebido de %s\n", inet_ntoa(client_addr.sin_addr));
 
                 //verifica se o cliente já existe, se não registra
@@ -115,14 +114,14 @@ int main(int argc, char *argv[]) {
                 }
 
                 packet ack_pkt;
-                memset(&ack_pkt, 0, sizeof(packet));
-                ack_pkt.type = htons(TYPE_ACK_DESCOBERTA);
+                memset(&ack_pkt, 0, sizeof(packet));  // Inicializa
+                ack_pkt.type = htons(TYPE_ACK_DESCOBERTA);  // Host to Network
                 sendto(sockfd, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);                
             }
 
-            else if (ntohs(pkt.type) == TYPE_REQ) {
-                uint32_t seqn = ntohl(pkt.seqn);
-                uint32_t value = ntohl(pkt.value);
+            else if (ntohs(pkt.type) == TYPE_REQ) {  // Network to Host
+                uint32_t seqn = ntohl(pkt.seqn);  // Network to Host
+                uint32_t value = ntohl(pkt.value);  // Network to Host
 
                 int origin_idx = find_client(&client_addr);
                 int dest_idx = find_client_ip(pkt.dest_addr);
@@ -132,7 +131,7 @@ int main(int argc, char *argv[]) {
                     printf("Cliente de origem não encontrado: %s\n", inet_ntoa(client_addr.sin_addr));
                     packet error_pkt;
                     memset(&error_pkt, 0, sizeof(packet));
-                    error_pkt.type = htons(TYPE_ERROR_REQ);
+                    error_pkt.type = htons(TYPE_ERROR_REQ);  // Host to Network
                     sendto(sockfd, &error_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
                     continue;
                 }
@@ -141,37 +140,35 @@ int main(int argc, char *argv[]) {
                     printf("Cliente de destino não encontrado: %s\n", inet_ntoa(pkt.dest_addr));
                     packet error_pkt;
                     memset(&error_pkt, 0, sizeof(packet));
-                    error_pkt.type = htons(TYPE_ERROR_REQ);
+                    error_pkt.type = htons(TYPE_ERROR_REQ);  // Host to Network
                     sendto(sockfd, &error_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
                     continue;
                 }
 
-                uint32_t new_balance = client_table[origin_idx].balance; 
+                uint32_t new_balance = (uint32_t)client_table[origin_idx].balance;  // Cast pra unsigned pro pacote
                 
-                //verifica se o saldo é o suficiente
-                if (client_table[origin_idx].balance >= value) {
-                    client_table[origin_idx].balance -= value; //debita da origem
-                    client_table[dest_idx].balance += value; //credita no destino
-
-                    client_table[origin_idx].last_req = seqn; //atualiza ultimo id
-
-                    new_balance = client_table[origin_idx].balance;
+                //verifica se o saldo é suficiente
+                if (client_table[origin_idx].balance >= (int32_t)value) {
+                    client_table[origin_idx].balance -= (int32_t)value; //debita da origem
+                    client_table[dest_idx].balance += (int32_t)value; //credita no destino
+                    
+                    client_table[origin_idx].last_req = seqn; // atualiza ultimo id
+                
+                    new_balance = (uint32_t)client_table[origin_idx].balance;
 
                     //atualiza servidor
                     num_transactions++;
                     total_transferred += value;
                 } else {
-                    //saldo insuficiente
-                    printf("Saldo insuficiente para cliente %s (saldo: %u, value: %u)\n", inet_ntoa(client_addr.sin_addr), client_table[origin_idx].balance, value);
+                    //saldo insuficiente - CORRIGIDO: %d pro balance (int32_t signed)
+                    printf("Saldo insuficiente para cliente %s (saldo: %d, value: %u)\n", inet_ntoa(client_addr.sin_addr), client_table[origin_idx].balance, value);
                 }
-
-                
                 //envia resposta ack
                 packet ack_pkt;
-                memset(&ack_pkt, 0, sizeof(packet));
-                ack_pkt.type = htons(TYPE_ACK_REQ);
-                ack_pkt.balance = htonl(new_balance);
-                ack_pkt.seqn = htonl(seqn); //ack do número de sequencia recebido
+                memset(&ack_pkt, 0, sizeof(packet));  // Inicializa
+                ack_pkt.type = htons(TYPE_ACK_REQ);  // Host to Network
+                ack_pkt.balance = htonl(new_balance);  // Host to Network
+                ack_pkt.seqn = htonl(seqn);  // Host to Network (usando o convertido)
                 sendto(sockfd, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
 
                 char ip_origin[INET_ADDRSTRLEN];
