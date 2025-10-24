@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <arpa/inet.h>
+#include <pthread.h>
 
 #define TYPE_DESCOBERTA 1
 #define TYPE_ACK_DESCOBERTA 2
@@ -25,6 +26,7 @@ typedef struct {
     struct in_addr client_ip;   //endereço ip do cliente
     uint32_t last_req;          // id da ultima requisicao
     int32_t balance;
+    pthread_mutex_t client_lock;
 } client_data;
 
 

@@ -2,6 +2,7 @@
     "makefile.configureOnOpen": true,
     "files.associations": {
         "inet.h": "c",
-        "stdint.h": "c"
+        "stdint.h": "c",
+        "pthread.h": "c"
     }
 }
