@@ -132,51 +132,81 @@ void* process_request(void* arg) {
             error_pkt.type = htons(TYPE_ERROR_REQ);
             sendto(sockfd, &error_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
         } else {
-            //se origem e destino existem processa
-            new_balance = (uint32_t)client_table[origin_idx].balance;
-            
-            //nao aceita auto-transferência
-            if (origin_idx == dest_idx) {
-                 printf("Erro: Cliente %s tentando transferir para si mesmo.\n", inet_ntoa(client_addr.sin_addr));
-                 send_ack = false;
-                 packet error_pkt;
-                 memset(&error_pkt, 0, sizeof(packet));
-                 error_pkt.type = htons(TYPE_ERROR_REQ);
-                 sendto(sockfd, &error_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
-            }
-            
-            // Verifica saldo
-            else if (client_table[origin_idx].balance >= (int32_t)value) {
-                client_table[origin_idx].balance -= (int32_t)value;
-                client_table[dest_idx].balance += (int32_t)value;
-                client_table[origin_idx].last_req = seqn;
-                new_balance = (uint32_t)client_table[origin_idx].balance;
+            uint32_t expected_seqn = client_table[origin_idx].last_req + 1;
+            uint32_t current_balance = (uint32_t)client_table[origin_idx].balance;
 
-                num_transactions++;
-                total_transferred += value;
+            //Pacote novo e esperado
+            if (seqn == expected_seqn) {
                 
-                char time_str[100];
-                char ip_origin[INET_ADDRSTRLEN];
-                char ip_dest[INET_ADDRSTRLEN];
-                strcpy(ip_origin, inet_ntoa(client_addr.sin_addr));
-                strcpy(ip_dest, inet_ntoa(pkt.dest_addr));
-                get_current_time(time_str, sizeof(time_str));
-                printf("%s client %s id_req %u dest %s value %u num_transactions %u total_transferred %u total_balance %u\n",
-                    time_str, ip_origin, seqn, ip_dest, value, 
-                    num_transactions, total_transferred, total_balance);
-            
-            } else {
-                printf("Saldo insuficiente para cliente %s (saldo: %d, value: %u)\n", 
-                       inet_ntoa(client_addr.sin_addr), client_table[origin_idx].balance, value);
-            }
-            
-            //envia resposta ack se nao houve erros
-            if (send_ack) {
+                uint32_t new_balance = current_balance;
+
+                if (origin_idx == dest_idx) {
+                    printf("Erro: Cliente %s tentando transferir para si mesmo.\n", inet_ntoa(client_addr.sin_addr));
+                    // (Envia ACK de falha abaixo)
+                }
+                // Verifica saldo
+                else if (client_table[origin_idx].balance >= (int32_t)value) {
+                    client_table[origin_idx].balance -= (int32_t)value;
+                    client_table[dest_idx].balance += (int32_t)value;
+                    client_table[origin_idx].last_req = seqn;
+                    new_balance = (uint32_t)client_table[origin_idx].balance;
+
+                    num_transactions++;
+                    total_transferred += value;
+                    
+                    // (Log da transação)
+                    char time_str[100];
+                    char ip_origin[INET_ADDRSTRLEN];
+                    char ip_dest[INET_ADDRSTRLEN];
+                    strcpy(ip_origin, inet_ntoa(client_addr.sin_addr));
+                    strcpy(ip_dest, inet_ntoa(pkt.dest_addr));
+                    get_current_time(time_str, sizeof(time_str));
+                    printf("%s client %s id_req %u dest %s value %u num_transactions %u total_transferred %u total_balance %u\n",
+                           time_str, ip_origin, seqn, ip_dest, value, 
+                           num_transactions, total_transferred, total_balance);
+                
+                } else {
+                    printf("Saldo insuficiente para cliente %s (saldo: %d, value: %u)\n", 
+                           inet_ntoa(client_addr.sin_addr), client_table[origin_idx].balance, value);
+                }
+
+                // Envia ACK para a requisição processada (ou falha por saldo/auto-transf)
                 packet ack_pkt;
                 memset(&ack_pkt, 0, sizeof(packet));
                 ack_pkt.type = htons(TYPE_ACK_REQ);
                 ack_pkt.balance = htonl(new_balance);
                 ack_pkt.seqn = htonl(seqn);
+                sendto(sockfd, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
+
+            }
+            //Pacote duplicado (seqn <= last_req)
+            //Pacote fora de ordem (seqn > expected_seqn)
+            else {
+                if (seqn <= client_table[origin_idx].last_req) {
+                    // Formato de log de duplicata conforme especificação [cite: 131]
+                    char time_str[100];
+                    char ip_origin[INET_ADDRSTRLEN];
+                    char ip_dest[INET_ADDRSTRLEN];
+                    
+                    get_current_time(time_str, sizeof(time_str));
+                    strcpy(ip_origin, inet_ntoa(client_addr.sin_addr));
+                    strcpy(ip_dest, inet_ntoa(pkt.dest_addr));
+                    
+                    // Imprime o log formatado com "DUP!!"
+                    printf("%s client %s DUP!! id req %u dest %s value %u num_transactions %u total_transferred %u total_balance %u\n",
+                           time_str, ip_origin, seqn, ip_dest, value, 
+                           num_transactions, total_transferred, total_balance);
+                } else {
+                    printf("Requisição fora de ordem recebida de %s (seqn: %u, esperado: %u). Enviando ACK do último.\n", 
+                           inet_ntoa(client_addr.sin_addr), seqn, expected_seqn);
+                }
+                
+                // Reenviar o ACK da *última* requisição processada
+                packet ack_pkt;
+                memset(&ack_pkt, 0, sizeof(packet));
+                ack_pkt.type = htons(TYPE_ACK_REQ);
+                ack_pkt.balance = htonl(current_balance);
+                ack_pkt.seqn = htonl(client_table[origin_idx].last_req);
                 sendto(sockfd, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
             }
         }

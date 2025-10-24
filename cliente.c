@@ -6,10 +6,13 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <time.h>
-#include <sys/select.h>  // FIX: Adicionado pra timeout com select
+#include <sys/select.h>
+#include <stdbool.h>
 #include "common.h"
 
 #define BROADCAST_IP "255.255.255.255"
+#define MAX_RETRIES 3
+#define TIMEOUT_MS 10
 
 int main(int argc, char *argv[]) {
     
@@ -90,43 +93,58 @@ int main(int argc, char *argv[]) {
             req_pkt.value = htonl(valor);
             inet_aton(ip_str, &req_pkt.dest_addr); 
 
-            //envia requisicao
-            sendto(sockfd, &req_pkt, sizeof(packet), 0, (const struct sockaddr *)&server_addr, sizeof(server_addr));
-
-            //aguarda resposta - COM TIMEOUT
-            packet ack_pkt;
-            struct timeval timeout;
-            timeout.tv_sec = 5;  // 5s timeout
-            timeout.tv_usec = 0;
-            fd_set readfds;
-            FD_ZERO(&readfds);
-            FD_SET(sockfd, &readfds);
-            int ready = select(sockfd + 1, &readfds, NULL, NULL, &timeout);
-            if (ready > 0) {
-                n = recvfrom(sockfd, &ack_pkt, sizeof(packet), 0, NULL, NULL);
-                // JÁ CORRIGIDO: ntohs/ntohl pro type, seqn e balance (evita valores gigantes como 1024 ou 16777216)
-                if (n > 0 && ntohs(ack_pkt.type) == TYPE_ACK_REQ && ntohl(ack_pkt.seqn) == seqn_local) {
-                    now = time(0);
-                    t = localtime(&now);
-                    strftime(time_buffer, sizeof(time_buffer), "%Y-%m-%d %H:%M:%S", t);
-
-                    // imprime resultado - JÁ CORRIGIDO: ntohl pro balance (e seqn_local pro id req)
-                    printf("%s server %s id req %u dest %s value %u new_balance %u\n", time_buffer, inet_ntoa(server_addr.sin_addr), seqn_local, ip_str, valor, ntohl(ack_pkt.balance));
-                } else if (ntohs(ack_pkt.type) == TYPE_ERROR_REQ) {  // ADICIONADO: Tratamento pro erro do servidor
-                    fprintf(stderr, "Erro no servidor: Requisição inválida (ex.: cliente destino não encontrado).\n");
+            bool ack_received = false;
+            for (int retries = 0; retries < MAX_RETRIES; retries++) {
+                if (retries > 0) {
+                    printf("Reenviando req #%u (tentativa %d/%d)...\n", seqn_local, retries + 1, MAX_RETRIES);
                 } else {
-                    // timeouts e retransmissao
-                    fprintf(stderr, "Erro: ACK não recebido ou pacote inválido (type: %d, seqn: %u vs esperado %u).\n", ntohs(ack_pkt.type), ntohl(ack_pkt.seqn), seqn_local);
+                    printf("Enviando req #%u para %s (valor: %u)...\n", seqn_local, ip_str, valor);
                 }
-            } else {
-                fprintf(stderr, "Timeout na recepção de ACK. Pacote perdido.\n");
+                
+                //envia requisicao
+                sendto(sockfd, &req_pkt, sizeof(packet), 0, (const struct sockaddr *)&server_addr, sizeof(server_addr));
+
+                //aguarda resposta - COM TIMEOUT
+                packet ack_pkt;
+                struct timeval timeout;
+                timeout.tv_sec = 0;
+                timeout.tv_usec = TIMEOUT_MS * 1000;
+                fd_set readfds;
+                FD_ZERO(&readfds);
+                FD_SET(sockfd, &readfds);
+                int ready = select(sockfd + 1, &readfds, NULL, NULL, &timeout);
+                if (ready > 0) {
+                    n = recvfrom(sockfd, &ack_pkt, sizeof(packet), 0, NULL, NULL);
+                    //Verifica se é o ACK da requisição
+                    if (n > 0 && ntohs(ack_pkt.type) == TYPE_ACK_REQ && ntohl(ack_pkt.seqn) == seqn_local) {
+                        now = time(0);
+                        t = localtime(&now);
+                        strftime(time_buffer, sizeof(time_buffer), "%Y-%m-%d %H:%M:%S", t);
+                        printf("%s server %s id req %u dest %s value %u new_balance %u\n", time_buffer, inet_ntoa(server_addr.sin_addr), seqn_local, ip_str, valor, ntohl(ack_pkt.balance));
+                        ack_received = true;
+                        break;
+                    } else if (n > 0 && ntohs(ack_pkt.type) == TYPE_ERROR_REQ) {
+                        fprintf(stderr, "Erro no servidor: Requisição #%u falhou (ex.: cliente destino não encontrado).\n", seqn_local);
+                        ack_received = true;
+                        break;
+                    } else {
+                        fprintf(stderr, "Erro: ACK não recebido ou pacote inválido (type: %d, seqn: %u vs esperado %u).\n", ntohs(ack_pkt.type), ntohl(ack_pkt.seqn), seqn_local);
+                    }
+                } else if (ready == 0) {
+                    // --- TIMEOUT ---
+                    printf("Timeout na recepção de ACK (tentativa %d/%d).\n", retries + 1, MAX_RETRIES);
+                } else {
+                    perror("select");
+                    break;
+                } // --- Fim do loop de retransmissão ---
+            }
+            if (!ack_received) {
+                fprintf(stderr, "Falha ao enviar requisição #%u após %d tentativas. Desistindo.\n", seqn_local, MAX_RETRIES);
             }
         }
     } else {
         printf("Nenhuma resposta do servidor recebida.\n");
     }
-    
-
     close(sockfd);
     return 0;
 }
