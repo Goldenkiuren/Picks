@@ -16,6 +16,8 @@
 #define INITIAL_BALANCE 100
 #define LOG_MSG_LEN 256
 
+void get_current_time(char* buffer, size_t buffer_size);
+
 //globais do servidor
 client_data client_table[MAX_CLIENTS];
 int num_clients = 0;
