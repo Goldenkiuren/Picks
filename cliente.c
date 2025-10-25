@@ -12,26 +12,26 @@
 #include "common.h"
 
 //constantes globais
-#define BROADCAST_IP "255.255.255.255" //ip de broadcast para descoberta
-#define MAX_RETRIES 3 //tentativas de envio de requisicao
-#define TIMEOUT_MS 10 //timeout para esperar ack (ms)
-#define MSG_BUFFER_SIZE 512 //tamanho do buffer de log/output
+#define BROADCAST_IP "255.255.255.255"
+#define MAX_RETRIES 3
+#define TIMEOUT_MS 10
+#define MSG_BUFFER_SIZE 512
 
 //globais do cliente
 //requisição
-char req_ip[20]; //buffer do ip de requisição
-uint32_t req_valor; //valor de requisição
-bool req_ready = false; //requisição pronta pra ser processada pela thread principal
-pthread_mutex_t req_mutex = PTHREAD_MUTEX_INITIALIZER; //protege acesso às variáveis de requisição
-pthread_cond_t req_cond = PTHREAD_COND_INITIALIZER; //condição para sinalizar entre produtor(input) e consumidor(main)
+char req_ip[20];
+uint32_t req_valor;
+bool req_ready = false;
+pthread_mutex_t req_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t req_cond = PTHREAD_COND_INITIALIZER;
 //resposta
-char resp_msg[MSG_BUFFER_SIZE]; //buffer para mensagem stdout
-bool resp_ready = false; //indica se resposta esta pronta para ser impressa
-pthread_mutex_t resp_mutex = PTHREAD_MUTEX_INITIALIZER; //protege acesso às variáveis de resposta
-pthread_cond_t resp_cond = PTHREAD_COND_INITIALIZER; //condição para sinalizar entre produtor(main/input) e consumidor(output)
+char resp_msg[MSG_BUFFER_SIZE];
+bool resp_ready = false;
+pthread_mutex_t resp_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t resp_cond = PTHREAD_COND_INITIALIZER;
 //flags de controle
-bool program_exit = false; //sinaliza que deve encerrar
-bool server_found = false; //sinaliza que  servidor foi descoberto
+bool program_exit = false;
+bool server_found = false;
 
 /*
 função produtora para a thread de output
