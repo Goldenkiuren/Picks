@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  
+  servidor:
+    build: .
+    # (Opcional) Se seu servidor precisa da porta, adicione-a
+    command: sh -c "./servidor 4000 > resultadosServidor.txt 2>&1"
+    networks:
+      sisop_net:
+        ipv4_address: 10.5.0.10
+    # 'volumes' permite que os logs (ex: resultadosServidor.txt)
+    # apareçam na sua pasta local.
+    volumes:
+      - .:/app 
+
+  cliente48:
+    build: .
+    # Este é o comando mágico!
+    # sh -c "..." permite rodar comandos com redirecionamento
+    command: sh -c "./cliente 4000 < requests_48.txt > resu48.txt 2>&1"
+    networks:
+      sisop_net:
+        ipv4_address: 10.5.0.48
+    depends_on:
+      - servidor
+    # 'volumes' faz com que ele leia o 'requests_48.txt' da sua pasta
+    # e escreva o 'resu48.txt' de volta para ela.
+    volumes:
+      - .:/app 
+
+  cliente50:
+    build: .
+    command: sh -c "./cliente 4000 < requests_50.txt > resu50.txt 2>&1"
+    networks:
+      sisop_net:
+        ipv4_address: 10.5.0.50
+    depends_on:
+      - servidor
+    volumes:
+      - .:/app
+
+networks:
+  sisop_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.5.0.0/24
