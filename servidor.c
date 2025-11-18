@@ -42,8 +42,7 @@ static pthread_mutex_t log_mutex;   //mutex para acessar fila de logs
 static pthread_cond_t  update_cond; //variavel de condicao para sinalizar para a thread de -
                                     //- interface que novos logs estao disponiveis
 
-/* 
-aloca um nó. copia a mensagem de log para ele. adiciona ao final da fila. sinaliza para a interface o novo item.
+/* aloca um nó. copia a mensagem de log para ele. adiciona ao final da fila. sinaliza para a interface o novo item.
 */
 static void push_log(const char *txt) {
     log_node_t *n = malloc(sizeof(log_node_t));
@@ -172,8 +171,6 @@ void get_current_time(char* buffer, size_t buffer_size) {
     strftime(buffer, buffer_size, "%Y-%m-%d %H:%M:%S", t);
 }
 
-
-
 //estrutura para passar dados para a thread
 typedef struct {
     packet pkt;
@@ -232,215 +229,207 @@ void* process_request(void* arg) {
 
         uint32_t new_balance = 0;
         
-        bool send_ack = true; //controlar envio de ack e error
-        
-        if (origin_idx == -1) { //cliente de origem ou destino desconhecido
+        if (origin_idx == -1) { //cliente de origem desconhecido
             packet error_pkt;
             memset(&error_pkt, 0, sizeof(packet));
             error_pkt.type = htons(TYPE_ERROR_REQ);
             sendto(sockfd, &error_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
-            
         }
-        
-        else if (dest_idx == -1) {    //cliente de destino não existe
-            packet error_pkt;
-            memset(&error_pkt, 0, sizeof(packet));
-            error_pkt.type = htons(TYPE_ERROR_REQ);
-            sendto(sockfd, &error_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
-        } 
-        
         else {
-            //lógica de travamento
-            bool self_transfer = (origin_idx == dest_idx);
-            int lock1_idx = origin_idx;
-            int lock2_idx = dest_idx;
-            
-            //garante que o mutex com indice menor seja travado primeiro (evita deadlock)
-            if (!self_transfer) {
-                lock1_idx = (origin_idx < dest_idx) ? origin_idx : dest_idx;
-                lock2_idx = (origin_idx > dest_idx) ? origin_idx : dest_idx;
-            }
-
-            //bloqueia mutex clientes
-            pthread_mutex_lock(&client_table[lock1_idx].client_lock);
-            if (!self_transfer) {
-                pthread_mutex_lock(&client_table[lock2_idx].client_lock);
-            }
-            
-            //seção critica clientes
-            uint32_t expected_seqn = client_table[origin_idx].last_req + 1;
-            uint32_t current_balance = (uint32_t)client_table[origin_idx].balance;
-            new_balance = current_balance;
-            uint32_t last_processed_seqn = client_table[origin_idx].last_req;
-
-            //Pacote novo e esperado
-            if (seqn == expected_seqn) {
-                if (value == 0) {
-                    // 1. a consulta de saldo é uma requisição válida, então logamos
-                    //(não altera num_transactions ou total_transferred)
-                    uint32_t local_num_trans, local_total_trans, local_total_bal;
-                    pthread_mutex_lock(&stats_mutex);
-                    local_num_trans = num_transactions;
-                    local_total_trans = total_transferred;
-                    local_total_bal = total_balance;
-                    pthread_mutex_unlock(&stats_mutex);
-
-                    get_current_time(time_str, sizeof(time_str));
-                    strcpy(ip_origin, inet_ntoa(client_addr.sin_addr));
-                    strcpy(ip_dest, inet_ntoa(pkt.dest_addr));
+            // CORREÇÃO: Verifica se o destino é inválido DENTRO do contexto do cliente de origem
+            // para poder atualizar o seqn e evitar dessincronização.
+            if (dest_idx == -1) {
+                pthread_mutex_lock(&client_table[origin_idx].client_lock);
+                // Se o pacote for o esperado, atualizamos last_req (consumimos o seqn) e enviamos erro
+                if (seqn == client_table[origin_idx].last_req + 1) {
+                    client_table[origin_idx].last_req = seqn;
                     
-                    snprintf(logbuf, sizeof(logbuf),
-                             "%s client %s id req %u dest %s value 0 num_transactions %u total_transferred %u total_balance %u",
-                             time_str, ip_origin, seqn, ip_dest,
-                             local_num_trans, local_total_trans, local_total_bal);
-                    push_log(logbuf);
-                    
-                    // 2. envia ACK com saldo ATUAL e seqn ATUAL
+                    packet error_pkt;
+                    memset(&error_pkt, 0, sizeof(packet));
+                    error_pkt.type = htons(TYPE_ERROR_REQ);
+                    sendto(sockfd, &error_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
+                } 
+                else {
+                    // Se for duplicado ou fora de ordem, reenvia o último ACK válido
                     packet ack_pkt;
                     memset(&ack_pkt, 0, sizeof(packet));
                     ack_pkt.type = htons(TYPE_ACK_REQ);
-                    ack_pkt.balance = htonl(current_balance); 
+                    ack_pkt.balance = htonl(client_table[origin_idx].balance); 
+                    ack_pkt.seqn = htonl(client_table[origin_idx].last_req);
+                    sendto(sockfd, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
+                }
+                pthread_mutex_unlock(&client_table[origin_idx].client_lock);
+            }
+            else {
+                // Destino válido, prossegue com a lógica original de travamento duplo
+                bool self_transfer = (origin_idx == dest_idx);
+                int lock1_idx = origin_idx;
+                int lock2_idx = dest_idx;
+                
+                //garante que o mutex com indice menor seja travado primeiro (evita deadlock)
+                if (!self_transfer) {
+                    lock1_idx = (origin_idx < dest_idx) ? origin_idx : dest_idx;
+                    lock2_idx = (origin_idx > dest_idx) ? origin_idx : dest_idx;
+                }
+
+                //bloqueia mutex clientes
+                pthread_mutex_lock(&client_table[lock1_idx].client_lock);
+                if (!self_transfer) {
+                    pthread_mutex_lock(&client_table[lock2_idx].client_lock);
+                }
+                
+                //seção critica clientes
+                uint32_t expected_seqn = client_table[origin_idx].last_req + 1;
+                uint32_t current_balance = (uint32_t)client_table[origin_idx].balance;
+                new_balance = current_balance;
+
+                //Pacote novo e esperado
+                if (seqn == expected_seqn) {
+                    if (value == 0) {
+                        // consulta de saldo
+                        uint32_t local_num_trans, local_total_trans, local_total_bal;
+                        pthread_mutex_lock(&stats_mutex);
+                        local_num_trans = num_transactions;
+                        local_total_trans = total_transferred;
+                        local_total_bal = total_balance;
+                        pthread_mutex_unlock(&stats_mutex);
+
+                        get_current_time(time_str, sizeof(time_str));
+                        strcpy(ip_origin, inet_ntoa(client_addr.sin_addr));
+                        strcpy(ip_dest, inet_ntoa(pkt.dest_addr));
+                        
+                        snprintf(logbuf, sizeof(logbuf),
+                                "%s client %s id req %u dest %s value 0 num_transactions %u total_transferred %u total_balance %u",
+                                time_str, ip_origin, seqn, ip_dest,
+                                local_num_trans, local_total_trans, local_total_bal);
+                        push_log(logbuf);
+                        
+                        packet ack_pkt;
+                        memset(&ack_pkt, 0, sizeof(packet));
+                        ack_pkt.type = htons(TYPE_ACK_REQ);
+                        ack_pkt.balance = htonl(current_balance); 
+                        ack_pkt.seqn = htonl(seqn);
+                        sendto(sockfd, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
+                        
+                        client_table[origin_idx].last_req = seqn;
+                        
+                        // libera travas e encerra a thread (early exit)
+                        pthread_mutex_unlock(&client_table[lock1_idx].client_lock);
+                        if (!self_transfer) {
+                            pthread_mutex_unlock(&client_table[lock2_idx].client_lock);
+                        }
+                        free(arg); 
+                        return NULL;
+                    }
+                    
+                    if (self_transfer) {} //auto-transferencia nao faz nada
+                    
+                    //verifica se tem saldo suficiente
+                    else if (current_balance >= value) {
+                        //executa a transferencia
+                        client_table[origin_idx].balance -= (int32_t)value;
+                        client_table[dest_idx].balance += (int32_t)value;
+                        new_balance = (uint32_t)client_table[origin_idx].balance;
+
+                        //atualiza estatisticas globais (transferencia bem-sucedida)
+                        pthread_mutex_lock(&stats_mutex);
+                        num_transactions++;
+                        total_transferred += value;
+                        pthread_mutex_unlock(&stats_mutex);                 
+                    }
+                    
+                    //atualiza o ultimo seqn processado para este cliente
+                    client_table[origin_idx].last_req = seqn;
+
+                    //pega estatisticas para o log
+                    uint32_t local_num_trans, local_total_trans, local_total_bal;
+                    pthread_mutex_lock(&stats_mutex);
+                    local_num_trans = num_transactions;
+                    local_total_trans = total_transferred;
+                    local_total_bal = total_balance;
+                    pthread_mutex_unlock(&stats_mutex);
+                    
+                    //loga a tentativa de transferencia
+                    get_current_time(time_str, sizeof(time_str));
+                    strcpy(ip_origin, inet_ntoa(client_addr.sin_addr));
+                    strcpy(ip_dest, inet_ntoa(pkt.dest_addr));
+                    
+                    snprintf(logbuf, sizeof(logbuf),
+                            "%s client %s id req %u dest %s value %u num_transactions %u total_transferred %u total_balance %u",
+                            time_str, ip_origin, seqn, ip_dest, value, 
+                            local_num_trans, local_total_trans, local_total_bal);
+                    push_log(logbuf);
+
+                    //envia ACK
+                    packet ack_pkt;
+                    memset(&ack_pkt, 0, sizeof(packet));
+                    ack_pkt.type = htons(TYPE_ACK_REQ);
+                    ack_pkt.balance = htonl(new_balance);
                     ack_pkt.seqn = htonl(seqn);
                     sendto(sockfd, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
-                    
-                    // 3. atualiza o last_req 
-                    // sem isso o, o cliente vai ficar reenviando a consulta.
-                    client_table[origin_idx].last_req = seqn;
-                    
-                    // 4. libera travas e encerra a thread
-                    pthread_mutex_unlock(&client_table[lock1_idx].client_lock);
-                    if (!self_transfer) {
-                        pthread_mutex_unlock(&client_table[lock2_idx].client_lock);
-                    }
-                    free(arg); 
-                    return NULL; //termina a thread
                 }
-                
-                if (self_transfer) {} //auto-transferencia nao faz nada
-                
-                //verifica se tem saldo suficiente
-                else if (current_balance >= value) {
-                    //executa a transferencia
-                    client_table[origin_idx].balance -= (int32_t)value;
-                    client_table[dest_idx].balance += (int32_t)value;
-                    new_balance = (uint32_t)client_table[origin_idx].balance;
-
-                    //atualiza estatisticas globais (transferencia bem-sucedida)
-                    uint32_t local_num_trans, local_total_trans, local_total_bal;
-                    pthread_mutex_lock(&stats_mutex);
-                    num_transactions++;
-                    total_transferred += value;
-                    local_num_trans = num_transactions;
-                    local_total_trans = total_transferred;
-                    local_total_bal = total_balance;
-                    pthread_mutex_unlock(&stats_mutex);                 
-                }
-                else {} //saldo insuficiente. 'new_balance' continua 'current_balance'
-                
-                //atualiza o ultimo seqn processado para este cliente
-                client_table[origin_idx].last_req = seqn;
-                last_processed_seqn = seqn;
-
-                //pega estatisticas para o log (mesmo se a transacao falhou por saldo)
-                uint32_t local_num_trans, local_total_trans, local_total_bal;
-                pthread_mutex_lock(&stats_mutex);
-                local_num_trans = num_transactions;
-                local_total_trans = total_transferred;
-                local_total_bal = total_balance;
-                pthread_mutex_unlock(&stats_mutex);
-                
-                //loga a tentativa de transferencia
-                get_current_time(time_str, sizeof(time_str));
-                strcpy(ip_origin, inet_ntoa(client_addr.sin_addr));
-                strcpy(ip_dest, inet_ntoa(pkt.dest_addr));
-                
-                snprintf(logbuf, sizeof(logbuf),
-                         "%s client %s id req %u dest %s value %u num_transactions %u total_transferred %u total_balance %u",
-                         time_str, ip_origin, seqn, ip_dest, value, 
-                         local_num_trans, local_total_trans, local_total_bal);
-                push_log(logbuf);
-
-                //envia ACK para a requisição processada (com sucesso ou falha)
-                packet ack_pkt;
-                memset(&ack_pkt, 0, sizeof(packet));
-                ack_pkt.type = htons(TYPE_ACK_REQ);
-                ack_pkt.balance = htonl(new_balance);   // o novo saldo (ou o antigo se falhou)
-                ack_pkt.seqn = htonl(seqn);             // confirma o seqn da requisicao
-                sendto(sockfd, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
-            }
-
-            //pacote duplicado (seqn <= last_req) ou pacote fora de ordem (seqn > expected_seqn)
-            else {
-
-                //se for duplicata, loga como "DUP!!""
-                if (seqn <= client_table[origin_idx].last_req) {
-                    
-                    //log de duplicata 
-                    char time_str[100];
-                    char ip_origin[INET_ADDRSTRLEN];
-                    char ip_dest[INET_ADDRSTRLEN];
-                    
-                    get_current_time(time_str, sizeof(time_str));
-                    strcpy(ip_origin, inet_ntoa(client_addr.sin_addr));
-                    strcpy(ip_dest, inet_ntoa(pkt.dest_addr));
-                    uint32_t local_num_trans, local_total_trans, local_total_bal;
-                    pthread_mutex_lock(&stats_mutex);
-                    local_num_trans = num_transactions;
-                    local_total_trans = total_transferred;
-                    local_total_bal = total_balance;
-                    pthread_mutex_unlock(&stats_mutex);
-                    snprintf(logbuf, sizeof(logbuf),
-                           "%s client %s DUP!! id req %u dest %s value %u num_transactions %u total_transferred %u total_balance %u",
-                           time_str, ip_origin, seqn, ip_dest, value, 
-                           local_num_trans, local_total_trans, local_total_bal);
-                    push_log(logbuf);
-                } 
-                
-                //se for fora de orgem (pacote do futuro), loga normalmente
+                //pacote duplicado ou fora de ordem
                 else {
-                    get_current_time(time_str, sizeof(time_str));
-                    strcpy(ip_origin, inet_ntoa(client_addr.sin_addr));
-                    strcpy(ip_dest, inet_ntoa(pkt.dest_addr));
-                    uint32_t local_num_trans, local_total_trans, local_total_bal;
-                    pthread_mutex_lock(&stats_mutex);
-                    local_num_trans = num_transactions;
-                    local_total_trans = total_transferred;
-                    local_total_bal = total_balance;
-                    pthread_mutex_unlock(&stats_mutex);
+                    if (seqn <= client_table[origin_idx].last_req) {
+                        //log de duplicata
+                        get_current_time(time_str, sizeof(time_str));
+                        strcpy(ip_origin, inet_ntoa(client_addr.sin_addr));
+                        strcpy(ip_dest, inet_ntoa(pkt.dest_addr));
+                        uint32_t local_num_trans, local_total_trans, local_total_bal;
+                        pthread_mutex_lock(&stats_mutex);
+                        local_num_trans = num_transactions;
+                        local_total_trans = total_transferred;
+                        local_total_bal = total_balance;
+                        pthread_mutex_unlock(&stats_mutex);
+                        snprintf(logbuf, sizeof(logbuf),
+                            "%s client %s DUP!! id req %u dest %s value %u num_transactions %u total_transferred %u total_balance %u",
+                            time_str, ip_origin, seqn, ip_dest, value, 
+                            local_num_trans, local_total_trans, local_total_bal);
+                        push_log(logbuf);
+                    } 
+                    else {
+                        // pacote do futuro, log normal
+                        get_current_time(time_str, sizeof(time_str));
+                        strcpy(ip_origin, inet_ntoa(client_addr.sin_addr));
+                        strcpy(ip_dest, inet_ntoa(pkt.dest_addr));
+                        uint32_t local_num_trans, local_total_trans, local_total_bal;
+                        pthread_mutex_lock(&stats_mutex);
+                        local_num_trans = num_transactions;
+                        local_total_trans = total_transferred;
+                        local_total_bal = total_balance;
+                        pthread_mutex_unlock(&stats_mutex);
+                        
+                        snprintf(logbuf, sizeof(logbuf),
+                                "%s client %s id req %u dest %s value %u num_transactions %u total_transferred %u total_balance %u",
+                                time_str, ip_origin, seqn, ip_dest, value, 
+                                local_num_trans, local_total_trans, local_total_bal);
+                        push_log(logbuf);
+                    }
                     
-                    snprintf(logbuf, sizeof(logbuf),
-                             "%s client %s id req %u dest %s value %u num_transactions %u total_transferred %u total_balance %u",
-                             time_str, ip_origin, seqn, ip_dest, value, 
-                             local_num_trans, local_total_trans, local_total_bal);
-                    push_log(logbuf);
+                    //reenviar o ACK da ultima requisicao processada
+                    packet ack_pkt;
+                    memset(&ack_pkt, 0, sizeof(packet));
+                    ack_pkt.type = htons(TYPE_ACK_REQ);
+                    ack_pkt.balance = htonl(current_balance);
+                    ack_pkt.seqn = htonl(client_table[origin_idx].last_req);
+                    sendto(sockfd, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
                 }
-                
-                //reenviar o ACK da ultima requisicao processada
-                packet ack_pkt;
-                memset(&ack_pkt, 0, sizeof(packet));
-                ack_pkt.type = htons(TYPE_ACK_REQ);
-                ack_pkt.balance = htonl(current_balance);                   //saldo atual (resultado do ultimo ACK)
-                ack_pkt.seqn = htonl(client_table[origin_idx].last_req);    //seqn do ultimo ACK
-                sendto(sockfd, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
-            }
 
-            //fim da secao critica
-            //libera as travas na ordem inversa da aquisicao
-            pthread_mutex_unlock(&client_table[lock1_idx].client_lock);
-            if (!self_transfer) {
-                pthread_mutex_unlock(&client_table[lock2_idx].client_lock);
+                //fim da secao critica
+                pthread_mutex_unlock(&client_table[lock1_idx].client_lock);
+                if (!self_transfer) {
+                    pthread_mutex_unlock(&client_table[lock2_idx].client_lock);
+                }
             }
         }
     }
     
     //tratamento para outros types
-    else if(ntohs(pkt.type) == TYPE_ERROR_REQ) {} //ignora erros
-    else {}  //ignora tipos de pacotes desconhecidos
+    else if(ntohs(pkt.type) == TYPE_ERROR_REQ) {} 
+    else {} 
     free(arg);
     return NULL;
 }
-
-
 
 int main(int argc, char *argv[]) {
     
