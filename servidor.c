@@ -359,7 +359,15 @@ void* process_request(void* arg) {
                     ack_pkt.seqn = htonl(client_table[origin_idx].last_req);
                     sendto(sockfd, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
                     
-                    // Log de duplicata opcional...
+                    get_current_time(time_str, sizeof(time_str));
+                    strcpy(ip_origin, inet_ntoa(client_addr.sin_addr));
+                    strcpy(ip_dest, inet_ntoa(pkt.dest_addr));
+
+                    snprintf(logbuf, sizeof(logbuf),
+                             "%s client %s DUP req %u dest %s value %u ignored (already processed)",
+                             time_str, ip_origin, seqn, ip_dest, value);
+                    
+                    push_log(logbuf);
                 } 
                 // Se for do futuro (seqn > expected), ignoramos silenciosamente (o cliente reenviará o correto)
             }
