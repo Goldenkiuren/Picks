@@ -14,7 +14,7 @@
 //constantes globais
 #define BROADCAST_IP "255.255.255.255"
 #define MAX_RETRIES 3
-#define TIMEOUT_MS 500 // Aumentado um pouco para evitar falso positivo em rede local
+#define TIMEOUT_MS 500
 #define MSG_BUFFER_SIZE 512
 
 //globais do cliente
@@ -96,7 +96,7 @@ void* input_thread_func(void* arg) {
     char ip_str[20];
     uint32_t valor;
     
-    //espera ate a thread main encontrar o servidor pela primeira vez
+    // espera ate a thread main encontrar o servidor pela primeira vez
     while (!server_found) {
         bool exit_flag;
         pthread_mutex_lock(&resp_mutex);
@@ -106,7 +106,7 @@ void* input_thread_func(void* arg) {
         usleep(100000); 
     }
 
-    //loop de leitura da entrada
+    // loop de leitura da entrada
     while (scanf("%s %u", ip_str, &valor) == 2) {
         struct in_addr temp_addr;
         if (inet_aton(ip_str, &temp_addr) == 0) {
@@ -114,7 +114,7 @@ void* input_thread_func(void* arg) {
             continue;
         }
         pthread_mutex_lock(&req_mutex);
-        //espera main processar a req anterior
+        // espera main processar a req anterior
         while (req_ready) {
             pthread_cond_wait(&req_cond, &req_mutex);
         }
@@ -149,7 +149,7 @@ int main(int argc, char *argv[]) {
     struct sockaddr_in server_addr, broadcast_addr;
     packet discovery_pkt, response_pkt;
 
-    //inicializa a thread de output imediatamente para logar tudo
+    // inicializa a thread de output imediatamente para logar tudo
     pthread_t output_tid;
     if (pthread_create(&output_tid, NULL, output_thread_func, NULL) != 0) {
         perror("falha ao criar thread de output");
@@ -176,7 +176,7 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    //configura endereco de broadcast
+    // configura endereco de broadcast
     memset(&broadcast_addr, 0, sizeof(broadcast_addr));
     broadcast_addr.sin_family = AF_INET;
     broadcast_addr.sin_port = htons(port);
@@ -188,8 +188,8 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    // [NOVO] Loop de Reconexão para Suporte a Falhas (Replicação Transparente)
-    uint32_t seqn_local = 0; //contador de seq local
+    // loop de reconexão
+    uint32_t seqn_local = 0; // contador de seq local
     pthread_t input_tid;
     bool input_thread_started = false;
 
@@ -207,7 +207,7 @@ int main(int argc, char *argv[]) {
             
             sendto(sockfd, &discovery_pkt, sizeof(packet), 0, (const struct sockaddr *)&broadcast_addr, sizeof(broadcast_addr));
 
-            // Pequeno select para esperar resposta
+            // pequeno select para esperar resposta
             struct timeval timeout;
             timeout.tv_sec = 1; 
             timeout.tv_usec = 0;
@@ -247,14 +247,14 @@ int main(int argc, char *argv[]) {
             input_thread_started = true;
         }
 
-        //loop de requisição
+        // loop de requisição
         while (true) {
             char local_ip[20];
             uint32_t local_valor;
             uint32_t local_seqn;
             bool exit_flag = false;
 
-            //espera por uma requisição da thread de input
+            // espera por uma requisição da thread de input
             pthread_mutex_lock(&req_mutex);
             while (!req_ready) {
                 pthread_mutex_lock(&resp_mutex);
@@ -279,7 +279,7 @@ int main(int argc, char *argv[]) {
             strcpy(local_ip, req_ip);
             local_valor = req_valor;
             
-            // Só incrementa se for uma nova req (retries usam mesmo seqn, mas aqui é nova req do usuario)
+            // incrementa se for uma nova req
             seqn_local++; 
             local_seqn = seqn_local;
             req_ready = false;
@@ -297,7 +297,7 @@ int main(int argc, char *argv[]) {
 
             char temp_msg[MSG_BUFFER_SIZE];
             bool ack_received = false;
-            bool server_failed = false; // [NOVO] Detectar falha total
+            bool server_failed = false; // detectar falha total
 
             for (int retries = 0; retries < MAX_RETRIES; retries++) {
                 if (retries > 0) {
@@ -349,20 +349,14 @@ int main(int argc, char *argv[]) {
             } 
             
             if (!ack_received) {
-                // [NOVO] Se falhou todas tentativas, assumimos que o servidor caiu.
+                // servidor caiu
                 snprintf(temp_msg, sizeof(temp_msg), "Falha critica: Servidor não responde. Iniciando redescoberta...");
                 send_to_output(temp_msg);
-                
-                // Precisamos "devolver" a requisição? 
-                // Para simplificar, o cliente vai ter que digitar de novo (ou poderíamos manter no buffer),
-                // mas vamos apenas sair do loop interno para acionar a descoberta novamente.
-                // Como o seqn foi gasto, decrementamos para reutilizar se a aplicação fosse complexa, 
-                // mas aqui seguimos a vida.
                 server_failed = true;
             }
 
             if (server_failed) {
-                break; // Sai do loop "while(true)" de requisições e volta para o loop de Descoberta
+                break; // sai do loop de requisições e volta para o loop de descoberta
             }
         } 
     }

@@ -11,21 +11,21 @@
 #include <errno.h>
 #include "common.h"
 
-//constantes globais
+// constantes globais
 #define BUFFER_SIZE 1024
 #define MAX_CLIENTS 100
 #define INITIAL_BALANCE 100
 #define LOG_MSG_LEN 256
 #define MAX_REPLICAS 10 
 
-// [NOVO] Configurações de tempo para eleição
-#define HEARTBEAT_INTERVAL_US 500000 // 0.5s (Líder envia)
-#define ELECTION_TIMEOUT_US 1500000  // 1.5s (Backup espera antes de assumir falha)
-#define WAIT_ANSWER_TIMEOUT_US 1000000 // 1.0s (Espera resposta de IDs maiores)
+// configurações de tempo para eleição
+#define HEARTBEAT_INTERVAL_US 500000
+#define ELECTION_TIMEOUT_US 1500000
+#define WAIT_ANSWER_TIMEOUT_US 1000000
 
 void get_current_time(char* buffer, size_t buffer_size);
 
-//globais do servidor
+// globais do servidor
 client_data client_table[MAX_CLIENTS];
 int num_clients = 0;
 uint32_t num_transactions = 0;
@@ -33,14 +33,14 @@ uint32_t total_transferred = 0;
 uint32_t total_balance = 0;
 int sockfd;
 
-// [NOVO] Controle de Replicação e Eleição
+// controle de replicação e eleição
 int my_id = 0;
 bool is_leader = false;
-int current_leader_id = -1; // ID do líder atual conhecido
-struct timespec last_heartbeat_time; // Última vez que ouvimos o líder
+int current_leader_id = -1;
+struct timespec last_heartbeat_time;
 
 typedef struct {
-    int id; // [NOVO] ID é crucial para o algoritmo do Valentão
+    int id;
     struct sockaddr_in addr;
     bool active;
 } replica_info;
@@ -48,18 +48,18 @@ typedef struct {
 replica_info replicas[MAX_REPLICAS];
 int num_replicas = 0;
 
-// Mutexes
+// mutexes
 pthread_mutex_t client_table_mutex;
 pthread_mutex_t stats_mutex;
 pthread_mutex_t log_mutex;
 pthread_cond_t  update_cond;
 
-// [NOVO] Mutex para controle de eleição
+// mutex para controle de eleição
 pthread_mutex_t election_mutex = PTHREAD_MUTEX_INITIALIZER;
 bool election_in_progress = false;
-bool received_answer = false; // Flag para saber se alguém maior respondeu
+bool received_answer = false; // flag para saber se alguém maior respondeu
 
-// Sistema de LOG (mantido original)
+// sistema de log
 typedef struct log_node {
     char text[LOG_MSG_LEN];
     struct log_node *next;
@@ -102,7 +102,7 @@ static void *interface_thread(void *arg) {
     return NULL;
 }
 
-// Funções auxiliares mantidas
+// funções auxiliares
 int find_client(struct sockaddr_in* cliaddr) {
     for (int i = 0; i < num_clients; i++) {
         if (client_table[i].client_ip.s_addr == cliaddr->sin_addr.s_addr) return i;
@@ -117,25 +117,25 @@ int find_client_ip(struct in_addr ip_addr) {
     return -1;
 }
 
-// [NOVO] Helper para enviar pacote para uma réplica específica
+// helper para enviar pacote para uma réplica específica
 void send_to_replica(int replica_idx, int type) {
     if (replicas[replica_idx].id == my_id) return;
     packet pkt;
     memset(&pkt, 0, sizeof(packet));
     pkt.type = htons(type);
-    pkt.seqn = htonl(my_id); // Usa seqn para transportar o ID do remetente nas msgs de controle
+    pkt.seqn = htonl(my_id);
     sendto(sockfd, &pkt, sizeof(packet), 0, 
           (struct sockaddr*)&replicas[replica_idx].addr, sizeof(struct sockaddr_in));
 }
 
-// [NOVO] Broadcast para todas as réplicas
+// broadcast para todas as réplicas
 void broadcast_to_replicas(int type) {
     for(int i=0; i < num_replicas; i++) {
         send_to_replica(i, type);
     }
 }
 
-// Replicação de transação (modificada para usar o array de replicas)
+// replicação de transação
 void replicate_transaction(struct in_addr src, struct in_addr dest, uint32_t value, uint32_t seqn, uint32_t balance_src) {
     packet rep_pkt;
     memset(&rep_pkt, 0, sizeof(packet));
@@ -187,7 +187,7 @@ void get_current_time(char* buffer, size_t buffer_size) {
     strftime(buffer, buffer_size, "%Y-%m-%d %H:%M:%S", t);
 }
 
-// [NOVO] Função chamada quando este processo se torna líder
+// assumir liderança
 void become_leader() {
     pthread_mutex_lock(&election_mutex);
     is_leader = true;
@@ -199,11 +199,11 @@ void become_leader() {
     snprintf(logbuf, sizeof(logbuf), "--- EU SOU O NOVO LIDER (ID %d) ---", my_id);
     push_log(logbuf);
 
-    // Avisa a todos que sou o coordenador
+    // avisa liderança
     broadcast_to_replicas(TYPE_COORDINATOR);
 }
 
-// [NOVO] Inicia o processo de eleição (Valentão)
+// inicia o processo de eleição
 void start_election() {
     pthread_mutex_lock(&election_mutex);
     election_in_progress = true;
@@ -215,7 +215,7 @@ void start_election() {
     push_log(logbuf);
 
     bool sent_election = false;
-    // 1. Envia ELECTION para todos com ID maior
+    // 1. envia ELECTION para todos com ID maior
     for(int i=0; i<num_replicas; i++) {
         if (replicas[i].id > my_id) {
             send_to_replica(i, TYPE_ELECTION);
@@ -223,22 +223,22 @@ void start_election() {
         }
     }
 
-    // 2. Se não há ninguém com ID maior, eu venço imediatamente
+    // 2. se não há ninguém com ID maior, vence imediatamente
     if (!sent_election) {
         become_leader();
         return;
     }
 
-    // 3. Espera por respostas (ANSWER)
+    // 3. espera por respostas
     usleep(WAIT_ANSWER_TIMEOUT_US); 
 
     pthread_mutex_lock(&election_mutex);
     if (!received_answer) {
-        // Ninguém maior respondeu, eu ganho
+        // ninguém maior respondeu, ganha
         pthread_mutex_unlock(&election_mutex);
         become_leader();
     } else {
-        // Alguém maior respondeu, volto a ser backup e espero o COORDINATOR
+        // alguém maior respondeu, volta a ser backup e espera o COORDINATOR
         election_in_progress = false;
         pthread_mutex_unlock(&election_mutex);
         snprintf(logbuf, sizeof(logbuf), "--- Recebi ANSWER, aguardando novo Lider... ---");
@@ -246,38 +246,36 @@ void start_election() {
     }
 }
 
-// [NOVO] Thread dedicada ao monitoramento e heartbeat
+// thread dedicada ao monitoramento e heartbeat
 void* monitor_thread(void* arg) {
-    // Inicializa tempo
     clock_gettime(CLOCK_MONOTONIC, &last_heartbeat_time);
 
     while(1) {
         if (is_leader) {
-            // Se sou líder, envio Heartbeats periodicamente
+            // envio heartbeats periodicamente
             broadcast_to_replicas(TYPE_HEARTBEAT);
             usleep(HEARTBEAT_INTERVAL_US);
         } else {
-            // Se sou backup, verifico se o líder morreu
+            // verifica se o líder morreu
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
             
-            // Calcula diferença em microsegundos
             long diff_us = (now.tv_sec - last_heartbeat_time.tv_sec) * 1000000 + 
                            (now.tv_nsec - last_heartbeat_time.tv_nsec) / 1000;
 
             if (diff_us > ELECTION_TIMEOUT_US) {
-                // Timeout! Líder morto.
+                // líder morto.
                 if (!election_in_progress) {
                     char logbuf[LOG_MSG_LEN];
                     snprintf(logbuf, sizeof(logbuf), "--- TIMEOUT DETECTADO DO LIDER %d ---", current_leader_id);
                     push_log(logbuf);
                     
-                    // Reseta timer para não spammar
+                    // reseta timer para não spammar
                     clock_gettime(CLOCK_MONOTONIC, &last_heartbeat_time);
                     start_election();
                 }
             }
-            usleep(200000); // Check a cada 200ms
+            usleep(200000); // check a cada 200ms
         }
 
     }
@@ -302,27 +300,22 @@ void* process_request(void* arg) {
     char time_str[100];
 
     uint16_t type = ntohs(pkt.type);
-    uint32_t sender_id = ntohl(pkt.seqn); // Nas msgs de controle, seqn carrega o ID
+    uint32_t sender_id = ntohl(pkt.seqn); // nas msgs de controle, seqn carrega o ID
 
-    // --- TRATAMENTO DE MENSAGENS DE CONTROLE (ALGORITMO VALENTÃO) ---
+    // --- TRATAMENTO DE MENSAGENS DE CONTROLE  ---
 
     if (type == TYPE_HEARTBEAT) {
-        // Atualiza timestamp do heartbeat
+        // atualiza timestamp
         if (!is_leader) {
             clock_gettime(CLOCK_MONOTONIC, &last_heartbeat_time);
             if (current_leader_id != (int)sender_id) {
                 current_leader_id = (int)sender_id;
-                // snprintf(logbuf, sizeof(logbuf), "Heartbeat recebido do Lider %d", current_leader_id);
-                // push_log(logbuf);
             }
         }
     }
 
     else if (type == TYPE_ELECTION) {
-        // Alguém com ID menor quer ser líder. 
-        // 1. Respondo ANSWER (para calar o menor)
-        // 2. Inicio minha eleição (se não estiver rodando)
-        
+        // eleicao        
         packet ans_pkt;
         memset(&ans_pkt, 0, sizeof(packet));
         ans_pkt.type = htons(TYPE_ANSWER);
@@ -333,22 +326,22 @@ void* process_request(void* arg) {
         push_log(logbuf);
 
         if (!election_in_progress && !is_leader) {
-            // Adicione uma verificação rápida com lock antes de criar a thread
+            //  verificação rápida com lock antes de criar a thread
             pthread_mutex_lock(&election_mutex);
             bool should_start = !election_in_progress && !is_leader;
-            if(should_start) election_in_progress = true; // "Reserva" o estado para não criar threads duplicadas
+            if(should_start) election_in_progress = true;
             pthread_mutex_unlock(&election_mutex);
 
             if (should_start) {
                 pthread_t elect_tid;
-                pthread_create(&elect_tid, NULL, (void*)start_election, NULL); // start_election deve lidar com o reset de flags se falhar
+                pthread_create(&elect_tid, NULL, (void*)start_election, NULL);
                 pthread_detach(elect_tid);
             }
         }
     }
 
     else if (type == TYPE_ANSWER) {
-        // Recebi resposta de alguém maior. Desisto.
+        // recebe resposta de alguém maior e desisto.
         pthread_mutex_lock(&election_mutex);
         if (election_in_progress) {
             received_answer = true;
@@ -359,12 +352,12 @@ void* process_request(void* arg) {
     }
 
     else if (type == TYPE_COORDINATOR) {
-        // Novo líder eleito
+        // novo líder eleito
         pthread_mutex_lock(&election_mutex);
         is_leader = false;
         current_leader_id = (int)sender_id;
         election_in_progress = false;
-        clock_gettime(CLOCK_MONOTONIC, &last_heartbeat_time); // Reseta timeout
+        clock_gettime(CLOCK_MONOTONIC, &last_heartbeat_time);
         pthread_mutex_unlock(&election_mutex);
 
         snprintf(logbuf, sizeof(logbuf), "--- NOVO COORDENADOR RECONHECIDO: ID %d ---", current_leader_id);
@@ -373,14 +366,14 @@ void* process_request(void* arg) {
 
     // --- LÓGICA DE DESCOBERTA (CLIENTE) ---
     else if (type == TYPE_DESCOBERTA) {
-        // Apenas o LÍDER responde descoberta
+        // apenas o LÍDER responde descoberta
         if (is_leader) {
             pthread_mutex_lock(&client_table_mutex);
             int client_idx = find_client(&client_addr);
             
             if (client_idx == -1) {
                 int id = register_new_client(&client_addr);
-                // Replica criação do cliente
+                // replica criação do cliente
                 if (id != -1) {
                     replicate_transaction(client_addr.sin_addr, client_addr.sin_addr, 0, 0, INITIAL_BALANCE);
                 }
@@ -390,26 +383,26 @@ void* process_request(void* arg) {
             packet ack_pkt;
             memset(&ack_pkt, 0, sizeof(packet));
             ack_pkt.type = htons(TYPE_ACK_DESCOBERTA);
-            sendto(sockfd_local, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);                
+            sendto(sockfd_local, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
         }
     }
 
-    // --- REPLICAÇÃO PASSIVA (LÍDER -> BACKUP) ---
+    // --- REPLICAÇÃO PASSIVA ---
     else if (type == TYPE_REPLICATION) {
-        // Backup recebe atualização de estado
-        if (is_leader) { free(arg); return NULL; } // Líder ignora replicação (loopback prevention)
+        // backup recebe atualização de estado
+        if (is_leader) { free(arg); return NULL; } // líder ignora replicação (loopback prevention)
 
         struct in_addr src_ip = pkt.src_addr;
         struct in_addr dest_ip = pkt.dest_addr;
         uint32_t val = ntohl(pkt.value);
         uint32_t r_seqn = ntohl(pkt.seqn);
 
-        // Reset heartbeat timer pois recebemos dados válidos do líder
+        // reset heartbeat timer pois recebemos dados válidos do líder
         clock_gettime(CLOCK_MONOTONIC, &last_heartbeat_time);
 
         pthread_mutex_lock(&client_table_mutex);
         
-        // Sincroniza tabela de clientes (simplificado)
+        // sincroniza tabela de clientes
         int src_idx = find_client_ip(src_ip);
         if (src_idx == -1 && num_clients < MAX_CLIENTS) {
             src_idx = num_clients++;
@@ -442,7 +435,7 @@ void* process_request(void* arg) {
                     }
                 }
                 
-                // Atualiza stats do backup para manter consistência
+                // atualiza stats do backup para manter consistência
                 pthread_mutex_lock(&stats_mutex);
                 if (val > 0) {
                     num_transactions++; 
@@ -461,7 +454,7 @@ void* process_request(void* arg) {
     else if (type == TYPE_REQ) {
         
         if (!is_leader) {
-            // Backup não responde clientes, mas pode enviar erro para forçar redescoberta
+            // backup não responde clientes, mas pode enviar erro para forçar redescoberta
              packet error_pkt;
              memset(&error_pkt, 0, sizeof(packet));
              error_pkt.type = htons(TYPE_ERROR_REQ);
@@ -484,7 +477,6 @@ void* process_request(void* arg) {
             error_pkt.type = htons(TYPE_ERROR_REQ);
             sendto(sockfd_local, &error_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
         } else {
-            // Mesma lógica de travamento do original
             int lock1 = origin_idx;
             int lock2 = -1;
             if (dest_idx != -1 && dest_idx != origin_idx) {
@@ -503,7 +495,7 @@ void* process_request(void* arg) {
                 client_table[origin_idx].last_req = seqn;
 
                 if (dest_idx == -1) {
-                    // Erro destino
+                    // erro destino
                     packet error_pkt;
                     memset(&error_pkt, 0, sizeof(packet));
                     error_pkt.type = htons(TYPE_ERROR_REQ);
@@ -511,7 +503,7 @@ void* process_request(void* arg) {
                     replicate_transaction(client_addr.sin_addr, pkt.dest_addr, 0, seqn, current_balance);
                 }
                 else if (value == 0) {
-                    // Consulta
+                    // consulta
                     packet ack_pkt;
                     memset(&ack_pkt, 0, sizeof(packet));
                     ack_pkt.type = htons(TYPE_ACK_REQ);
@@ -521,13 +513,12 @@ void* process_request(void* arg) {
                     
                     replicate_transaction(client_addr.sin_addr, pkt.dest_addr, value, seqn, new_balance);
                     
-                    // Log simplificado
                     get_current_time(time_str, sizeof(time_str));
                     snprintf(logbuf, sizeof(logbuf), "%s CONSULTA id %d bal %u", time_str, origin_idx, current_balance);
                     push_log(logbuf);
 
                 } else {
-                    // Transferência
+                    // transferência
                     if (origin_idx != dest_idx && current_balance >= value) {
                         client_table[origin_idx].balance -= (int32_t)value;
                         client_table[dest_idx].balance += (int32_t)value;
@@ -546,7 +537,7 @@ void* process_request(void* arg) {
                     ack_pkt.seqn = htonl(seqn);
                     sendto(sockfd_local, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
 
-                    // Replicar para backups
+                    // replicar para backups
                     replicate_transaction(client_addr.sin_addr, pkt.dest_addr, value, seqn, new_balance);
                     
                     get_current_time(time_str, sizeof(time_str));
@@ -576,9 +567,7 @@ void* process_request(void* arg) {
 }
 
 int main(int argc, char *argv[]) {
-    
-    // [MODIFICADO] Argumentos agora exigem ID das réplicas para lógica do Valentão
-    // Uso: ./servidor <porta> <meu_id> <id_replica1> <ip_replica1> <porta_replica1> ...
+    // uso: ./servidor <porta> <meu_id> <id_replica1> <ip_replica1> <porta_replica1> ...
     if (argc < 3) {
         fprintf(stderr, "Uso: ./servidor <porta> <meu_id> [id_rep ip_rep porta_rep ...]\n");
         return 1;
@@ -587,14 +576,12 @@ int main(int argc, char *argv[]) {
     int port = atoi(argv[1]);
     my_id = atoi(argv[2]);
     
-    // Inicialmente, o maior ID é líder (lógica simplificada de boot). 
-    // Na prática, todos iniciam como backup e o monitor_thread dispara eleição.
     is_leader = false; 
     current_leader_id = -1;
 
     printf("Iniciando Servidor ID %d na porta %d.\n", my_id, port);
 
-    // Parse dos argumentos das replicas
+    // parse dos argumentos das replicas
     int arg_idx = 3;
     while(arg_idx < argc - 2 && num_replicas < MAX_REPLICAS) {
         int r_id = atoi(argv[arg_idx]);
@@ -610,7 +597,7 @@ int main(int argc, char *argv[]) {
         printf("Replica Vizinha: ID %d IP %s Port %d\n", r_id, ip_str, r_port);
 
         num_replicas++;
-        arg_idx += 3; // Pula 3 argumentos (id, ip, port)
+        arg_idx += 3;
     }
 
     struct sockaddr_in server_addr;
@@ -646,7 +633,7 @@ int main(int argc, char *argv[]) {
     }
     pthread_detach(int_tid);
 
-    // [NOVO] Inicia thread de monitoramento (Heartbeat/Timeout)
+    // inicia thread de monitoramento
     pthread_t mon_tid;
     if (pthread_create(&mon_tid, NULL, monitor_thread, NULL) != 0) {
         perror("falha ao criar thread de monitoramento");
@@ -654,7 +641,7 @@ int main(int argc, char *argv[]) {
     }
     pthread_detach(mon_tid);
 
-    // Dispara eleição inicial para definir quem manda
+    // dispara eleição inicial
     start_election();
     
     while(1) {
@@ -682,6 +669,21 @@ int main(int argc, char *argv[]) {
     }
 
     close(sockfd);
-    // cleanups omitidos para brevidade (igual ao original)
+    //cleanups
+    for (int i = 0; i < num_clients; i++) {
+        pthread_mutex_destroy(&client_table[i].client_lock);
+    }
+    pthread_mutex_lock(&log_mutex);
+    while (log_head != NULL) {
+        log_node_t *temp = log_head;
+        log_head = log_head->next;
+        free(temp);
+    }
+    pthread_mutex_unlock(&log_mutex);
+    pthread_mutex_destroy(&client_table_mutex);
+    pthread_mutex_destroy(&stats_mutex);
+    pthread_mutex_destroy(&log_mutex);
+    pthread_mutex_destroy(&election_mutex);
+    pthread_cond_destroy(&update_cond);
     return 0;
 }

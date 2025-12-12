@@ -12,7 +12,7 @@
 #define TYPE_ERROR_REQ 5 
 #define TYPE_REPLICATION 6 
 
-// [NOVO] Tipos para Eleição de Líder e Heartbeat
+// Tipos para Eleição de Líder e Heartbeat
 #define TYPE_HEARTBEAT 7    // Líder diz "estou vivo"
 #define TYPE_ELECTION 8     // "Eu quero ser líder" (para IDs maiores)
 #define TYPE_ANSWER 9       // "Eu sou maior, cale-se" (resposta ao Election)

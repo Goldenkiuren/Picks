@@ -42,7 +42,6 @@ services:
       - server1
       - server2
       - server3
-    # Mantém vivo para teste interativo
     command: sh -c "make && sleep infinity"
     volumes:
       - .:/app
@@ -58,7 +57,6 @@ services:
       - server1
       - server2
       - server3
-    # Mantém vivo para teste interativo
     command: sh -c "make && sleep infinity"
     volumes:
       - .:/app
