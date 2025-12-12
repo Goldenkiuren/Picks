@@ -8,6 +8,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <errno.h>
 #include "common.h"
 
 //constantes globais
@@ -15,6 +16,12 @@
 #define MAX_CLIENTS 100
 #define INITIAL_BALANCE 100
 #define LOG_MSG_LEN 256
+#define MAX_REPLICAS 10 
+
+// [NOVO] Configurações de tempo para eleição
+#define HEARTBEAT_INTERVAL_US 500000 // 0.5s (Líder envia)
+#define ELECTION_TIMEOUT_US 1500000  // 1.5s (Backup espera antes de assumir falha)
+#define WAIT_ANSWER_TIMEOUT_US 1000000 // 1.0s (Espera resposta de IDs maiores)
 
 void get_current_time(char* buffer, size_t buffer_size);
 
@@ -24,72 +31,68 @@ int num_clients = 0;
 uint32_t num_transactions = 0;
 uint32_t total_transferred = 0;
 uint32_t total_balance = 0;
+int sockfd;
 
-pthread_mutex_t client_table_mutex; //mutex para adicoes e buscas na tabela
-pthread_mutex_t stats_mutex;        //mutex para acessar estatisticas globais
+// [NOVO] Controle de Replicação e Eleição
+int my_id = 0;
+bool is_leader = false;
+int current_leader_id = -1; // ID do líder atual conhecido
+struct timespec last_heartbeat_time; // Última vez que ouvimos o líder
 
+typedef struct {
+    int id; // [NOVO] ID é crucial para o algoritmo do Valentão
+    struct sockaddr_in addr;
+    bool active;
+} replica_info;
 
-//nó de uma lista para a fila de logs
+replica_info replicas[MAX_REPLICAS];
+int num_replicas = 0;
+
+// Mutexes
+pthread_mutex_t client_table_mutex;
+pthread_mutex_t stats_mutex;
+pthread_mutex_t log_mutex;
+pthread_cond_t  update_cond;
+
+// [NOVO] Mutex para controle de eleição
+pthread_mutex_t election_mutex = PTHREAD_MUTEX_INITIALIZER;
+bool election_in_progress = false;
+bool received_answer = false; // Flag para saber se alguém maior respondeu
+
+// Sistema de LOG (mantido original)
 typedef struct log_node {
     char text[LOG_MSG_LEN];
     struct log_node *next;
 } log_node_t;
 
-//variaveis para sistema de log
 static log_node_t *log_head = NULL; 
 static log_node_t *log_tail = NULL;
-static pthread_mutex_t log_mutex;   //mutex para acessar fila de logs
-static pthread_cond_t  update_cond; //variavel de condicao para sinalizar para a thread de -
-                                    //- interface que novos logs estao disponiveis
 
-/* 
-aloca um nó. copia a mensagem de log para ele. adiciona ao final da fila. sinaliza para a interface o novo item.
-*/
 static void push_log(const char *txt) {
     log_node_t *n = malloc(sizeof(log_node_t));
-
-    if (!n) {return;} //falha na alocação
-
+    if (!n) {return;} 
     strncpy(n->text, txt, LOG_MSG_LEN-1);
     n->text[LOG_MSG_LEN-1] = '\0';
     n->next = NULL;
-
     pthread_mutex_lock(&log_mutex);
-    if (log_tail) {
-        log_tail->next = n;     //adicionado ao final
-    }
-
-    else {
-        log_head = n;           //fila vazia
-    }
-
+    if (log_tail) { log_tail->next = n; }
+    else { log_head = n; }
     log_tail = n;
-
-    //sinaliza a atualização
     pthread_cond_signal(&update_cond);
     pthread_mutex_unlock(&log_mutex);
 }
 
-/*
-thread para imprimir logs.
-fica a maior parte do tempo bloqueada, aguardando a variável de condição 'update_cond'.
-quando ativada, imprime todos os logs na fila e volta a aguardar.
-*/
 static void *interface_thread(void *arg) {
-    (void)arg;                      //evitar "unused parameter"
-    pthread_mutex_lock(&log_mutex); //trava inicial
+    (void)arg;
+    pthread_mutex_lock(&log_mutex); 
     while (1) {
         while (log_head == NULL) {
-            //espera por novas atualizações
             pthread_cond_wait(&update_cond, &log_mutex);
         }
-
-        //imprime todos os logs atualmente na fila 
         while (log_head) {
             log_node_t *n = log_head;
             log_head = n->next;
             if (log_head == NULL) log_tail = NULL;
-            
             printf("%s\n", n->text);
             fflush(stdout);
             free(n);
@@ -99,31 +102,56 @@ static void *interface_thread(void *arg) {
     return NULL;
 }
 
-//encontra o indice de um cliente na tabela pelo seu endereco
+// Funções auxiliares mantidas
 int find_client(struct sockaddr_in* cliaddr) {
     for (int i = 0; i < num_clients; i++) {
-        if (client_table[i].client_ip.s_addr == cliaddr->sin_addr.s_addr) {
-            return i;
-        }
+        if (client_table[i].client_ip.s_addr == cliaddr->sin_addr.s_addr) return i;
     }
     return -1;
 }
 
-//encontra o destino da transferencia
 int find_client_ip(struct in_addr ip_addr) {
     for (int i = 0; i < num_clients ; i++) {
-        if (client_table[i].client_ip.s_addr == ip_addr.s_addr) {
-            return i;
-        }
+        if (client_table[i].client_ip.s_addr == ip_addr.s_addr) return i;
     }
     return -1;
 }
 
-/*
-registra um novo cliente
-adiciona o cliente em 'client_table'. inicializa seu saldo. sera seu 'seqn'. inicializa seu mutex. 
-atualiza estatisticas globais.
-*/
+// [NOVO] Helper para enviar pacote para uma réplica específica
+void send_to_replica(int replica_idx, int type) {
+    if (replicas[replica_idx].id == my_id) return;
+    packet pkt;
+    memset(&pkt, 0, sizeof(packet));
+    pkt.type = htons(type);
+    pkt.seqn = htonl(my_id); // Usa seqn para transportar o ID do remetente nas msgs de controle
+    sendto(sockfd, &pkt, sizeof(packet), 0, 
+          (struct sockaddr*)&replicas[replica_idx].addr, sizeof(struct sockaddr_in));
+}
+
+// [NOVO] Broadcast para todas as réplicas
+void broadcast_to_replicas(int type) {
+    for(int i=0; i < num_replicas; i++) {
+        send_to_replica(i, type);
+    }
+}
+
+// Replicação de transação (modificada para usar o array de replicas)
+void replicate_transaction(struct in_addr src, struct in_addr dest, uint32_t value, uint32_t seqn, uint32_t balance_src) {
+    packet rep_pkt;
+    memset(&rep_pkt, 0, sizeof(packet));
+    rep_pkt.type = htons(TYPE_REPLICATION);
+    rep_pkt.src_addr = src;
+    rep_pkt.dest_addr = dest;
+    rep_pkt.value = htonl(value);
+    rep_pkt.seqn = htonl(seqn);
+    rep_pkt.balance = htonl(balance_src);
+    
+    for(int i=0; i < num_replicas; i++) {
+        sendto(sockfd, &rep_pkt, sizeof(packet), 0, 
+              (struct sockaddr*)&replicas[i].addr, sizeof(struct sockaddr_in));
+    }
+}
+
 int register_new_client(struct sockaddr_in* cliaddr) {
     if (num_clients < MAX_CLIENTS) {
         int new_client_id = num_clients;
@@ -131,14 +159,9 @@ int register_new_client(struct sockaddr_in* cliaddr) {
         client_table[new_client_id].last_req = 0;
         client_table[new_client_id].balance = INITIAL_BALANCE;
 
-        //mutex especifico do cliente
-        if (pthread_mutex_init(&client_table[new_client_id].client_lock, NULL) != 0) {
-            return -1; 
-        }
-
+        if (pthread_mutex_init(&client_table[new_client_id].client_lock, NULL) != 0) return -1; 
         num_clients++;
 
-        //atualiza estatisticas globais
         uint32_t current_total_balance;
         pthread_mutex_lock(&stats_mutex);
         total_balance += INITIAL_BALANCE;
@@ -147,34 +170,120 @@ int register_new_client(struct sockaddr_in* cliaddr) {
         uint32_t local_total_trans = total_transferred;
         pthread_mutex_unlock(&stats_mutex);
         
-        //loga o registro do novo cliente
         char time_str[100];
         char logbuf[LOG_MSG_LEN];
         get_current_time(time_str, sizeof(time_str));
-        snprintf(logbuf, sizeof(logbuf),
-                 "%s client %s id req 0 dest 0 value 0 num_transactions %u total_transferred %u total_balance %u",
-                 time_str,
-                 inet_ntoa(cliaddr->sin_addr),
-                 local_num_trans,
-                 local_total_trans,
-                 current_total_balance);
+        snprintf(logbuf, sizeof(logbuf), "%s REGISTRO client %s total_bal %u",
+                 time_str, inet_ntoa(cliaddr->sin_addr), current_total_balance);
         push_log(logbuf);        
         return new_client_id;
     }
-
     return -1;
 }
 
-// obtem a data/hora formatada
 void get_current_time(char* buffer, size_t buffer_size) {
     time_t now = time(0);
     struct tm *t = localtime(&now);
     strftime(buffer, buffer_size, "%Y-%m-%d %H:%M:%S", t);
 }
 
+// [NOVO] Função chamada quando este processo se torna líder
+void become_leader() {
+    pthread_mutex_lock(&election_mutex);
+    is_leader = true;
+    current_leader_id = my_id;
+    election_in_progress = false;
+    pthread_mutex_unlock(&election_mutex);
 
+    char logbuf[LOG_MSG_LEN];
+    snprintf(logbuf, sizeof(logbuf), "--- EU SOU O NOVO LIDER (ID %d) ---", my_id);
+    push_log(logbuf);
 
-//estrutura para passar dados para a thread
+    // Avisa a todos que sou o coordenador
+    broadcast_to_replicas(TYPE_COORDINATOR);
+}
+
+// [NOVO] Inicia o processo de eleição (Valentão)
+void start_election() {
+    pthread_mutex_lock(&election_mutex);
+    election_in_progress = true;
+    received_answer = false;
+    pthread_mutex_unlock(&election_mutex);
+
+    char logbuf[LOG_MSG_LEN];
+    snprintf(logbuf, sizeof(logbuf), "--- INICIANDO ELEICAO (Meu ID: %d) ---", my_id);
+    push_log(logbuf);
+
+    bool sent_election = false;
+    // 1. Envia ELECTION para todos com ID maior
+    for(int i=0; i<num_replicas; i++) {
+        if (replicas[i].id > my_id) {
+            send_to_replica(i, TYPE_ELECTION);
+            sent_election = true;
+        }
+    }
+
+    // 2. Se não há ninguém com ID maior, eu venço imediatamente
+    if (!sent_election) {
+        become_leader();
+        return;
+    }
+
+    // 3. Espera por respostas (ANSWER)
+    usleep(WAIT_ANSWER_TIMEOUT_US); 
+
+    pthread_mutex_lock(&election_mutex);
+    if (!received_answer) {
+        // Ninguém maior respondeu, eu ganho
+        pthread_mutex_unlock(&election_mutex);
+        become_leader();
+    } else {
+        // Alguém maior respondeu, volto a ser backup e espero o COORDINATOR
+        election_in_progress = false;
+        pthread_mutex_unlock(&election_mutex);
+        snprintf(logbuf, sizeof(logbuf), "--- Recebi ANSWER, aguardando novo Lider... ---");
+        push_log(logbuf);
+    }
+}
+
+// [NOVO] Thread dedicada ao monitoramento e heartbeat
+void* monitor_thread(void* arg) {
+    // Inicializa tempo
+    clock_gettime(CLOCK_MONOTONIC, &last_heartbeat_time);
+
+    while(1) {
+        if (is_leader) {
+            // Se sou líder, envio Heartbeats periodicamente
+            broadcast_to_replicas(TYPE_HEARTBEAT);
+            usleep(HEARTBEAT_INTERVAL_US);
+        } else {
+            // Se sou backup, verifico se o líder morreu
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            
+            // Calcula diferença em microsegundos
+            long diff_us = (now.tv_sec - last_heartbeat_time.tv_sec) * 1000000 + 
+                           (now.tv_nsec - last_heartbeat_time.tv_nsec) / 1000;
+
+            if (diff_us > ELECTION_TIMEOUT_US) {
+                // Timeout! Líder morto.
+                if (!election_in_progress) {
+                    char logbuf[LOG_MSG_LEN];
+                    snprintf(logbuf, sizeof(logbuf), "--- TIMEOUT DETECTADO DO LIDER %d ---", current_leader_id);
+                    push_log(logbuf);
+                    
+                    // Reseta timer para não spammar
+                    clock_gettime(CLOCK_MONOTONIC, &last_heartbeat_time);
+                    start_election();
+                }
+            }
+            usleep(200000); // Check a cada 200ms
+        }
+
+    }
+    return NULL;
+}
+
 typedef struct {
     packet pkt;
     struct sockaddr_in client_addr;
@@ -182,136 +291,244 @@ typedef struct {
     int sockfd;
 } request_data;
 
-/*
-função executada por nova thread.
-ela executa em uma nova thread para cada pacote recebido. lida com a descoberta de clientes.
-lida também com a descoberta de clientes e com as requisicoes de transação/consulta.
-*/
 void* process_request(void* arg) {
-
-    //recupera os dados da requisicao
     request_data* data = (request_data*)arg;
     packet pkt = data->pkt;
     struct sockaddr_in client_addr = data->client_addr;
-    int sockfd = data->sockfd;
+    int sockfd_local = data->sockfd;
     socklen_t len = data->len;
     
-    //buffers para logs
     char logbuf[LOG_MSG_LEN];
     char time_str[100];
-    char ip_origin[INET_ADDRSTRLEN];
-    char ip_dest[INET_ADDRSTRLEN];
 
-    //lógica de descoberta
-    if (ntohs(pkt.type) == TYPE_DESCOBERTA) {
-        pthread_mutex_lock(&client_table_mutex);
-        int client_idx = find_client(&client_addr);
+    uint16_t type = ntohs(pkt.type);
+    uint32_t sender_id = ntohl(pkt.seqn); // Nas msgs de controle, seqn carrega o ID
+
+    // --- TRATAMENTO DE MENSAGENS DE CONTROLE (ALGORITMO VALENTÃO) ---
+
+    if (type == TYPE_HEARTBEAT) {
+        // Atualiza timestamp do heartbeat
+        if (!is_leader) {
+            clock_gettime(CLOCK_MONOTONIC, &last_heartbeat_time);
+            if (current_leader_id != (int)sender_id) {
+                current_leader_id = (int)sender_id;
+                // snprintf(logbuf, sizeof(logbuf), "Heartbeat recebido do Lider %d", current_leader_id);
+                // push_log(logbuf);
+            }
+        }
+    }
+
+    else if (type == TYPE_ELECTION) {
+        // Alguém com ID menor quer ser líder. 
+        // 1. Respondo ANSWER (para calar o menor)
+        // 2. Inicio minha eleição (se não estiver rodando)
         
-        if (client_idx == -1) {
-            register_new_client(&client_addr);
+        packet ans_pkt;
+        memset(&ans_pkt, 0, sizeof(packet));
+        ans_pkt.type = htons(TYPE_ANSWER);
+        ans_pkt.seqn = htonl(my_id);
+        sendto(sockfd_local, &ans_pkt, sizeof(packet), 0, (struct sockaddr *)&client_addr, len);
+
+        snprintf(logbuf, sizeof(logbuf), "Recebi ELECTION de %d. Enviei ANSWER.", sender_id);
+        push_log(logbuf);
+
+        if (!election_in_progress && !is_leader) {
+            // Adicione uma verificação rápida com lock antes de criar a thread
+            pthread_mutex_lock(&election_mutex);
+            bool should_start = !election_in_progress && !is_leader;
+            if(should_start) election_in_progress = true; // "Reserva" o estado para não criar threads duplicadas
+            pthread_mutex_unlock(&election_mutex);
+
+            if (should_start) {
+                pthread_t elect_tid;
+                pthread_create(&elect_tid, NULL, (void*)start_election, NULL); // start_election deve lidar com o reset de flags se falhar
+                pthread_detach(elect_tid);
+            }
+        }
+    }
+
+    else if (type == TYPE_ANSWER) {
+        // Recebi resposta de alguém maior. Desisto.
+        pthread_mutex_lock(&election_mutex);
+        if (election_in_progress) {
+            received_answer = true;
+            snprintf(logbuf, sizeof(logbuf), "Recebi ANSWER de %d. Respeitando autoridade.", sender_id);
+            push_log(logbuf);
+        }
+        pthread_mutex_unlock(&election_mutex);
+    }
+
+    else if (type == TYPE_COORDINATOR) {
+        // Novo líder eleito
+        pthread_mutex_lock(&election_mutex);
+        is_leader = false;
+        current_leader_id = (int)sender_id;
+        election_in_progress = false;
+        clock_gettime(CLOCK_MONOTONIC, &last_heartbeat_time); // Reseta timeout
+        pthread_mutex_unlock(&election_mutex);
+
+        snprintf(logbuf, sizeof(logbuf), "--- NOVO COORDENADOR RECONHECIDO: ID %d ---", current_leader_id);
+        push_log(logbuf);
+    }
+
+    // --- LÓGICA DE DESCOBERTA (CLIENTE) ---
+    else if (type == TYPE_DESCOBERTA) {
+        // Apenas o LÍDER responde descoberta
+        if (is_leader) {
+            pthread_mutex_lock(&client_table_mutex);
+            int client_idx = find_client(&client_addr);
+            
+            if (client_idx == -1) {
+                int id = register_new_client(&client_addr);
+                // Replica criação do cliente
+                if (id != -1) {
+                    replicate_transaction(client_addr.sin_addr, client_addr.sin_addr, 0, 0, INITIAL_BALANCE);
+                }
+            }
+
+            pthread_mutex_unlock(&client_table_mutex);
+            packet ack_pkt;
+            memset(&ack_pkt, 0, sizeof(packet));
+            ack_pkt.type = htons(TYPE_ACK_DESCOBERTA);
+            sendto(sockfd_local, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);                
+        }
+    }
+
+    // --- REPLICAÇÃO PASSIVA (LÍDER -> BACKUP) ---
+    else if (type == TYPE_REPLICATION) {
+        // Backup recebe atualização de estado
+        if (is_leader) { free(arg); return NULL; } // Líder ignora replicação (loopback prevention)
+
+        struct in_addr src_ip = pkt.src_addr;
+        struct in_addr dest_ip = pkt.dest_addr;
+        uint32_t val = ntohl(pkt.value);
+        uint32_t r_seqn = ntohl(pkt.seqn);
+
+        // Reset heartbeat timer pois recebemos dados válidos do líder
+        clock_gettime(CLOCK_MONOTONIC, &last_heartbeat_time);
+
+        pthread_mutex_lock(&client_table_mutex);
+        
+        // Sincroniza tabela de clientes (simplificado)
+        int src_idx = find_client_ip(src_ip);
+        if (src_idx == -1 && num_clients < MAX_CLIENTS) {
+            src_idx = num_clients++;
+            client_table[src_idx].client_ip = src_ip;
+            client_table[src_idx].balance = INITIAL_BALANCE;
+            pthread_mutex_init(&client_table[src_idx].client_lock, NULL);
         }
 
+        int dest_idx = -1;
+        if (val > 0 || dest_ip.s_addr != 0) {
+             dest_idx = find_client_ip(dest_ip);
+             if (dest_idx == -1 && num_clients < MAX_CLIENTS) {
+                dest_idx = num_clients++;
+                client_table[dest_idx].client_ip = dest_ip;
+                client_table[dest_idx].balance = INITIAL_BALANCE;
+                pthread_mutex_init(&client_table[dest_idx].client_lock, NULL);
+            }
+        }
+        
+        if (src_idx != -1) {
+            pthread_mutex_lock(&client_table[src_idx].client_lock);
+            if (r_seqn > client_table[src_idx].last_req) {
+                client_table[src_idx].last_req = r_seqn;
+                if (val > 0) {
+                    client_table[src_idx].balance -= val;
+                    if (dest_idx != -1 && dest_idx != src_idx) {
+                        pthread_mutex_lock(&client_table[dest_idx].client_lock);
+                        client_table[dest_idx].balance += val;
+                        pthread_mutex_unlock(&client_table[dest_idx].client_lock);
+                    }
+                }
+                
+                // Atualiza stats do backup para manter consistência
+                pthread_mutex_lock(&stats_mutex);
+                if (val > 0) {
+                    num_transactions++; 
+                    total_transferred += val;
+                }
+                total_balance = 0;
+                for(int k=0; k<num_clients; k++) total_balance += client_table[k].balance;
+                pthread_mutex_unlock(&stats_mutex);
+            }
+            pthread_mutex_unlock(&client_table[src_idx].client_lock);
+        }
         pthread_mutex_unlock(&client_table_mutex);
-        packet ack_pkt;
-        memset(&ack_pkt, 0, sizeof(packet));
-        ack_pkt.type = htons(TYPE_ACK_DESCOBERTA);
-        sendto(sockfd, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);                
     }
     
-    //lógica de requisição
-    else if (ntohs(pkt.type) == TYPE_REQ) {
+    // --- REQUISIÇÃO DO CLIENTE ---
+    else if (type == TYPE_REQ) {
+        
+        if (!is_leader) {
+            // Backup não responde clientes, mas pode enviar erro para forçar redescoberta
+             packet error_pkt;
+             memset(&error_pkt, 0, sizeof(packet));
+             error_pkt.type = htons(TYPE_ERROR_REQ);
+             sendto(sockfd_local, &error_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
+             free(arg);
+             return NULL;
+        }
+
         uint32_t seqn = ntohl(pkt.seqn);
         uint32_t value = ntohl(pkt.value);
 
-        //busca IDs dos clientes de origem e destino
         pthread_mutex_lock(&client_table_mutex);
         int origin_idx = find_client(&client_addr);
         int dest_idx = find_client_ip(pkt.dest_addr);
         pthread_mutex_unlock(&client_table_mutex);
 
-        uint32_t new_balance = 0;
-        
         if (origin_idx == -1) { 
-            // Cliente de origem desconhecido: envia erro e não processa
             packet error_pkt;
             memset(&error_pkt, 0, sizeof(packet));
             error_pkt.type = htons(TYPE_ERROR_REQ);
-            sendto(sockfd, &error_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
-            
+            sendto(sockfd_local, &error_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
         } else {
-            // Define a ordem de travamento para evitar Deadlock
-            // Se o destino não existe (dest_idx == -1), travamos apenas a origem.
+            // Mesma lógica de travamento do original
             int lock1 = origin_idx;
             int lock2 = -1;
-
             if (dest_idx != -1 && dest_idx != origin_idx) {
-                if (origin_idx < dest_idx) {
-                    lock1 = origin_idx;
-                    lock2 = dest_idx;
-                } else {
-                    lock1 = dest_idx;
-                    lock2 = origin_idx;
-                }
+                if (origin_idx < dest_idx) { lock1 = origin_idx; lock2 = dest_idx; } 
+                else { lock1 = dest_idx; lock2 = origin_idx; }
             }
 
-            // Adquire os mutexes
             pthread_mutex_lock(&client_table[lock1].client_lock);
-            if (lock2 != -1) {
-                pthread_mutex_lock(&client_table[lock2].client_lock);
-            }
+            if (lock2 != -1) pthread_mutex_lock(&client_table[lock2].client_lock);
             
-            // Seção crítica
             uint32_t expected_seqn = client_table[origin_idx].last_req + 1;
             uint32_t current_balance = (uint32_t)client_table[origin_idx].balance;
-            new_balance = current_balance;
+            uint32_t new_balance = current_balance;
 
-            // Verifica se é o pacote esperado
             if (seqn == expected_seqn) {
-                
-                // Atualiza last_req IMEDIATAMENTE, pois estamos processando este seqn
                 client_table[origin_idx].last_req = seqn;
 
-                // Agora verificamos erros lógicos (como destino inexistente)
                 if (dest_idx == -1) {
-                    // Destino não encontrado: Envia Erro, mas o seqn já foi consumido
+                    // Erro destino
                     packet error_pkt;
                     memset(&error_pkt, 0, sizeof(packet));
                     error_pkt.type = htons(TYPE_ERROR_REQ);
-                    sendto(sockfd, &error_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
-                    
-                    // Opcional: Logar o erro no servidor para debug
+                    sendto(sockfd_local, &error_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
+                    replicate_transaction(client_addr.sin_addr, pkt.dest_addr, 0, seqn, current_balance);
                 }
                 else if (value == 0) {
-                    // Consulta de saldo
-                    uint32_t local_num_trans, local_total_trans, local_total_bal;
-                    pthread_mutex_lock(&stats_mutex);
-                    local_num_trans = num_transactions;
-                    local_total_trans = total_transferred;
-                    local_total_bal = total_balance;
-                    pthread_mutex_unlock(&stats_mutex);
-
-                    get_current_time(time_str, sizeof(time_str));
-                    strcpy(ip_origin, inet_ntoa(client_addr.sin_addr));
-                    strcpy(ip_dest, inet_ntoa(pkt.dest_addr));
-                    
-                    snprintf(logbuf, sizeof(logbuf),
-                             "%s client %s id req %u dest %s value 0 num_transactions %u total_transferred %u total_balance %u",
-                             time_str, ip_origin, seqn, ip_dest,
-                             local_num_trans, local_total_trans, local_total_bal);
-                    push_log(logbuf);
-                    
+                    // Consulta
                     packet ack_pkt;
                     memset(&ack_pkt, 0, sizeof(packet));
                     ack_pkt.type = htons(TYPE_ACK_REQ);
                     ack_pkt.balance = htonl(current_balance); 
                     ack_pkt.seqn = htonl(seqn);
-                    sendto(sockfd, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
+                    sendto(sockfd_local, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
+                    
+                    replicate_transaction(client_addr.sin_addr, pkt.dest_addr, value, seqn, new_balance);
+                    
+                    // Log simplificado
+                    get_current_time(time_str, sizeof(time_str));
+                    snprintf(logbuf, sizeof(logbuf), "%s CONSULTA id %d bal %u", time_str, origin_idx, current_balance);
+                    push_log(logbuf);
 
                 } else {
-                    // Transferência normal
-                    bool self_transfer = (origin_idx == dest_idx);
-
-                    if (!self_transfer && current_balance >= value) {
+                    // Transferência
+                    if (origin_idx != dest_idx && current_balance >= value) {
                         client_table[origin_idx].balance -= (int32_t)value;
                         client_table[dest_idx].balance += (int32_t)value;
                         new_balance = (uint32_t)client_table[origin_idx].balance;
@@ -322,60 +539,34 @@ void* process_request(void* arg) {
                         pthread_mutex_unlock(&stats_mutex);                 
                     }
                     
-                    // Logs e estatísticas
-                    uint32_t local_num_trans, local_total_trans, local_total_bal;
-                    pthread_mutex_lock(&stats_mutex);
-                    local_num_trans = num_transactions;
-                    local_total_trans = total_transferred;
-                    local_total_bal = total_balance;
-                    pthread_mutex_unlock(&stats_mutex);
-
-                    get_current_time(time_str, sizeof(time_str));
-                    strcpy(ip_origin, inet_ntoa(client_addr.sin_addr));
-                    strcpy(ip_dest, inet_ntoa(pkt.dest_addr));
-                    
-                    snprintf(logbuf, sizeof(logbuf),
-                             "%s client %s id req %u dest %s value %u num_transactions %u total_transferred %u total_balance %u",
-                             time_str, ip_origin, seqn, ip_dest, value, 
-                             local_num_trans, local_total_trans, local_total_bal);
-                    push_log(logbuf);
-
                     packet ack_pkt;
                     memset(&ack_pkt, 0, sizeof(packet));
                     ack_pkt.type = htons(TYPE_ACK_REQ);
                     ack_pkt.balance = htonl(new_balance);
                     ack_pkt.seqn = htonl(seqn);
-                    sendto(sockfd, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
+                    sendto(sockfd_local, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
+
+                    // Replicar para backups
+                    replicate_transaction(client_addr.sin_addr, pkt.dest_addr, value, seqn, new_balance);
+                    
+                    get_current_time(time_str, sizeof(time_str));
+                    snprintf(logbuf, sizeof(logbuf), "%s TRANSF %u from %d to %d", time_str, value, origin_idx, dest_idx);
+                    push_log(logbuf);
                 }
 
             } else {
-                // Pacote duplicado ou fora de ordem
+                // DUP
                 if (seqn <= client_table[origin_idx].last_req) {
-                    // DUP: Apenas reenvia o ACK da última requisição processada (com saldo ATUAL)
                     packet ack_pkt;
                     memset(&ack_pkt, 0, sizeof(packet));
                     ack_pkt.type = htons(TYPE_ACK_REQ);
                     ack_pkt.balance = htonl((uint32_t)client_table[origin_idx].balance);
                     ack_pkt.seqn = htonl(client_table[origin_idx].last_req);
-                    sendto(sockfd, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
-                    
-                    get_current_time(time_str, sizeof(time_str));
-                    strcpy(ip_origin, inet_ntoa(client_addr.sin_addr));
-                    strcpy(ip_dest, inet_ntoa(pkt.dest_addr));
-
-                    snprintf(logbuf, sizeof(logbuf),
-                             "%s client %s DUP req %u dest %s value %u ignored (already processed)",
-                             time_str, ip_origin, seqn, ip_dest, value);
-                    
-                    push_log(logbuf);
+                    sendto(sockfd_local, &ack_pkt, sizeof(packet), 0, (const struct sockaddr *)&client_addr, len);
                 } 
-                // Se for do futuro (seqn > expected), ignoramos silenciosamente (o cliente reenviará o correto)
             }
 
-            // Libera os mutexes na ordem inversa
-            if (lock2 != -1) {
-                pthread_mutex_unlock(&client_table[lock2].client_lock);
-            }
+            if (lock2 != -1) pthread_mutex_unlock(&client_table[lock2].client_lock);
             pthread_mutex_unlock(&client_table[lock1].client_lock);
         }
     }
@@ -384,20 +575,46 @@ void* process_request(void* arg) {
     return NULL;
 }
 
-
-
 int main(int argc, char *argv[]) {
     
-    if (argc != 2) {
-        fprintf(stderr, "Uso: ./servidor <porta>\n");
+    // [MODIFICADO] Argumentos agora exigem ID das réplicas para lógica do Valentão
+    // Uso: ./servidor <porta> <meu_id> <id_replica1> <ip_replica1> <porta_replica1> ...
+    if (argc < 3) {
+        fprintf(stderr, "Uso: ./servidor <porta> <meu_id> [id_rep ip_rep porta_rep ...]\n");
         return 1;
     }
 
     int port = atoi(argv[1]);
-    int sockfd;
+    my_id = atoi(argv[2]);
+    
+    // Inicialmente, o maior ID é líder (lógica simplificada de boot). 
+    // Na prática, todos iniciam como backup e o monitor_thread dispara eleição.
+    is_leader = false; 
+    current_leader_id = -1;
+
+    printf("Iniciando Servidor ID %d na porta %d.\n", my_id, port);
+
+    // Parse dos argumentos das replicas
+    int arg_idx = 3;
+    while(arg_idx < argc - 2 && num_replicas < MAX_REPLICAS) {
+        int r_id = atoi(argv[arg_idx]);
+        char* ip_str = argv[arg_idx+1];
+        int r_port = atoi(argv[arg_idx+2]);
+        
+        replicas[num_replicas].id = r_id; // Armazena ID
+        replicas[num_replicas].active = true;
+        replicas[num_replicas].addr.sin_family = AF_INET;
+        replicas[num_replicas].addr.sin_port = htons(r_port);
+        inet_aton(ip_str, &replicas[num_replicas].addr.sin_addr);
+        
+        printf("Replica Vizinha: ID %d IP %s Port %d\n", r_id, ip_str, r_port);
+
+        num_replicas++;
+        arg_idx += 3; // Pula 3 argumentos (id, ip, port)
+    }
+
     struct sockaddr_in server_addr;
     
-    //inicializa os mutexes e variaveis de condicao globais
     if (pthread_mutex_init(&client_table_mutex, NULL) != 0 || 
             pthread_mutex_init(&stats_mutex, NULL) != 0 ||
             pthread_mutex_init(&log_mutex, NULL) != 0 ||
@@ -406,94 +623,65 @@ int main(int argc, char *argv[]) {
             exit(EXIT_FAILURE);
     }
 
-    // configura o socket udp
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         perror("falha em criar o socket");
         exit(EXIT_FAILURE);
     }
     
-    //zera a estrutura de endereço do servidor
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;   //escuta em todas as interfaces de rede
-    server_addr.sin_port = htons(port);         //converte a porta pra "network byte order"
+    server_addr.sin_addr.s_addr = INADDR_ANY; 
+    server_addr.sin_port = htons(port); 
 
-
-    //vincula o scoket a porta e endereco especificados
     if (bind(sockfd, (const struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         perror("falha no bind");
         exit(EXIT_FAILURE);
     }
     
-    //inicialização da thread de interface/log
     pthread_t int_tid;
     if (pthread_create(&int_tid, NULL, interface_thread, NULL) != 0) {
         perror("falha ao criar thread de interface");
         close(sockfd);
         exit(EXIT_FAILURE);
     }
-    pthread_detach(int_tid);    //nao há join nela, ela roda sempre
+    pthread_detach(int_tid);
 
-    //log inicial
-    char time_str[100];
-    get_current_time(time_str, sizeof(time_str));
-    pthread_mutex_lock(&stats_mutex);
+    // [NOVO] Inicia thread de monitoramento (Heartbeat/Timeout)
+    pthread_t mon_tid;
+    if (pthread_create(&mon_tid, NULL, monitor_thread, NULL) != 0) {
+        perror("falha ao criar thread de monitoramento");
+        exit(EXIT_FAILURE);
+    }
+    pthread_detach(mon_tid);
 
-    //imprime o log inicial diretamente, pois a thread de log já pode estar rodando
-    printf("%s num_transactions %u total_transferred %u total_balance %u\n", 
-        time_str, num_transactions, total_transferred, total_balance);
-    pthread_mutex_unlock(&stats_mutex);
-    
+    // Dispara eleição inicial para definir quem manda
+    start_election();
     
     while(1) {
-        struct sockaddr_in client_addr_temp;    //endereço do cliente(temporario)
-        packet pkt_temp;                        //pacote recebido (temporario)
-        
+        struct sockaddr_in client_addr_temp;    
+        packet pkt_temp;                        
         socklen_t len = sizeof(client_addr_temp);
         
-        //aguarda a chegada de um pacote UDP
         int n = recvfrom(sockfd, &pkt_temp, sizeof(packet), 0, (struct sockaddr *)&client_addr_temp, &len);
         
-        if (n>0) {  //pacote recebido
-
-
-            // aloca memoria no heap para os dados da requisicao
+        if (n>0) {
             request_data* data = (request_data*)malloc(sizeof(request_data));
+            if (data == NULL) { continue; }
             
-            if (data == NULL) {
-                perror("falha ao alocar memória para thread.\n");
-                continue;
-            }
-            
-            //copia dados do pacote e do cliente para a struct alocada no heap
             data->pkt = pkt_temp;
             data->client_addr = client_addr_temp;
             data->len = len;
-            data->sockfd = sockfd;      //passa o socket para a thread poder responder
+            data->sockfd = sockfd;      
             
-            //thread para processar requisicao
             pthread_t thread_id;
             if (pthread_create(&thread_id, NULL, process_request, (void*)data) != 0) {
-                perror("falha ao criar thread");
-                free(data); //libera memória se a thread não foi criada
+                free(data);
             }
-            
-             
             pthread_detach(thread_id);
         }
     }
 
     close(sockfd);
-    pthread_mutex_destroy(&client_table_mutex);
-    pthread_mutex_destroy(&stats_mutex);
-    pthread_mutex_destroy(&log_mutex);
-    pthread_cond_destroy(&update_cond);
-
-    //destroi mutexes individuais de cada cliente
-    for (int i = 0; i < num_clients; i++) {
-        pthread_mutex_destroy(&client_table[i].client_lock);
-    }
-    
+    // cleanups omitidos para brevidade (igual ao original)
     return 0;
-
 }

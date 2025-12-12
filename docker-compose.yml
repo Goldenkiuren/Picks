@@ -1,48 +1,74 @@
 version: '3.8'
 
 services:
-  
-  servidor:
+  server1:
     build: .
-    # (Opcional) Se seu servidor precisa da porta, adicione-a
-    command: sh -c "./servidor 4000 > resultadosServidor.txt 2>&1"
-    networks:
-      sisop_net:
-        ipv4_address: 10.5.0.10
-    # 'volumes' permite que os logs (ex: resultadosServidor.txt)
-    # apareçam na sua pasta local.
-    volumes:
-      - .:/app 
-
-  cliente48:
-    build: .
-    # Este é o comando mágico!
-    # sh -c "..." permite rodar comandos com redirecionamento
-    command: sh -c "./cliente 4000 < requests_48.txt > resu48.txt 2>&1"
-    networks:
-      sisop_net:
-        ipv4_address: 10.5.0.48
-    depends_on:
-      - servidor
-    # 'volumes' faz com que ele leia o 'requests_48.txt' da sua pasta
-    # e escreva o 'resu48.txt' de volta para ela.
-    volumes:
-      - .:/app 
-
-  cliente50:
-    build: .
-    command: sh -c "./cliente 4000 < requests_50.txt > resu50.txt 2>&1"
-    networks:
-      sisop_net:
-        ipv4_address: 10.5.0.50
-    depends_on:
-      - servidor
+    container_name: server1
+    hostname: server1
+    command: sh -c "make clean && make && ./servidor 8080 1 2 172.20.0.11 8080 3 172.20.0.12 8080"
     volumes:
       - .:/app
+    networks:
+      app_network:
+        ipv4_address: 172.20.0.10
+
+  server2:
+    build: .
+    container_name: server2
+    hostname: server2
+    command: sh -c "make && ./servidor 8080 2 1 172.20.0.10 8080 3 172.20.0.12 8080"
+    volumes:
+      - .:/app
+    networks:
+      app_network:
+        ipv4_address: 172.20.0.11
+
+  server3:
+    build: .
+    container_name: server3
+    hostname: server3
+    command: sh -c "make && ./servidor 8080 3 1 172.20.0.10 8080 2 172.20.0.11 8080"
+    volumes:
+      - .:/app
+    networks:
+      app_network:
+        ipv4_address: 172.20.0.12
+
+  client1:
+    build: .
+    container_name: client1
+    hostname: client1
+    depends_on:
+      - server1
+      - server2
+      - server3
+    # Mantém vivo para teste interativo
+    command: sh -c "make && sleep infinity"
+    volumes:
+      - .:/app
+    networks:
+      app_network:
+        ipv4_address: 172.20.0.20
+
+  client2:
+    build: .
+    container_name: client2
+    hostname: client2
+    depends_on:
+      - server1
+      - server2
+      - server3
+    # Mantém vivo para teste interativo
+    command: sh -c "make && sleep infinity"
+    volumes:
+      - .:/app
+    networks:
+      app_network:
+        ipv4_address: 172.20.0.21
 
 networks:
-  sisop_net:
+  app_network:
     driver: bridge
     ipam:
       config:
-        - subnet: 10.5.0.0/24
+        - subnet: 172.20.0.0/16
