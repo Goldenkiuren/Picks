@@ -367,7 +367,7 @@ void* process_request(void* arg) {
                 pthread_create(&elect_tid, NULL, (void*)start_election, NULL);
                 pthread_detach(elect_tid);
             }
-            return; 
+            return NULL;
         }
         pthread_mutex_lock(&election_mutex);
         is_leader = false;
