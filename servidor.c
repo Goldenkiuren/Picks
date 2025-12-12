@@ -651,7 +651,11 @@ int main(int argc, char *argv[]) {
     pthread_detach(mon_tid);
 
     // dispara eleição inicial
-    start_election();
+    pthread_t initial_elect_tid;
+    if (pthread_create(&initial_elect_tid, NULL, (void*)start_election, NULL) != 0) {
+        perror("falha ao criar thread de eleicao inicial");
+    }
+    pthread_detach(initial_elect_tid);
     
     while(1) {
         struct sockaddr_in client_addr_temp;    
