@@ -21,7 +21,7 @@
 // configurações de tempo para eleição
 #define HEARTBEAT_INTERVAL_US 500000
 #define ELECTION_TIMEOUT_US 1500000
-#define WAIT_ANSWER_TIMEOUT_US 1000000
+#define WAIT_ANSWER_TIMEOUT_US 2500000
 
 void get_current_time(char* buffer, size_t buffer_size);
 
@@ -352,18 +352,27 @@ void* process_request(void* arg) {
     }
 
     else if (type == TYPE_COORDINATOR) {
-        // novo líder eleito
+        // verifica se o novo líder é um impostor (menor que eu)
+        if (sender_id < my_id) {
+            char logbuf[LOG_MSG_LEN];
+            snprintf(logbuf, sizeof(logbuf), "--- IGNORANDO COORDENADOR %d (SOU MAIOR: %d) E INICIANDO ELEICAO ---", sender_id, my_id);
+            push_log(logbuf);
+            
+            if (!election_in_progress) {
+                pthread_mutex_lock(&election_mutex);
+                election_in_progress = true;
+                pthread_mutex_unlock(&election_mutex);
+                
+                pthread_t elect_tid;
+                pthread_create(&elect_tid, NULL, (void*)start_election, NULL);
+                pthread_detach(elect_tid);
+            }
+            return; 
+        }
         pthread_mutex_lock(&election_mutex);
         is_leader = false;
         current_leader_id = (int)sender_id;
-        election_in_progress = false;
-        clock_gettime(CLOCK_MONOTONIC, &last_heartbeat_time);
-        pthread_mutex_unlock(&election_mutex);
-
-        snprintf(logbuf, sizeof(logbuf), "--- NOVO COORDENADOR RECONHECIDO: ID %d ---", current_leader_id);
-        push_log(logbuf);
     }
-
     // --- LÓGICA DE DESCOBERTA (CLIENTE) ---
     else if (type == TYPE_DESCOBERTA) {
         // apenas o LÍDER responde descoberta
