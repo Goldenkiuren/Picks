@@ -372,6 +372,11 @@ void* process_request(void* arg) {
         pthread_mutex_lock(&election_mutex);
         is_leader = false;
         current_leader_id = (int)sender_id;
+        if (election_in_progress) {
+            received_answer = true;
+            push_log("Recebi COORDINATOR durante eleição. Abortando minha candidatura.");
+        }
+        pthread_mutex_unlock(&election_mutex);
     }
     // --- LÓGICA DE DESCOBERTA (CLIENTE) ---
     else if (type == TYPE_DESCOBERTA) {
@@ -500,7 +505,7 @@ void* process_request(void* arg) {
             uint32_t current_balance = (uint32_t)client_table[origin_idx].balance;
             uint32_t new_balance = current_balance;
 
-            if (seqn == expected_seqn) {
+            if (seqn >= expected_seqn) {
                 client_table[origin_idx].last_req = seqn;
 
                 if (dest_idx == -1) {
@@ -576,6 +581,7 @@ void* process_request(void* arg) {
 }
 
 int main(int argc, char *argv[]) {
+    setbuf(stdout, NULL);
     // uso: ./servidor <porta> <meu_id> <id_replica1> <ip_replica1> <porta_replica1> ...
     if (argc < 3) {
         fprintf(stderr, "Uso: ./servidor <porta> <meu_id> [id_rep ip_rep porta_rep ...]\n");

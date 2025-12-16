@@ -5,7 +5,7 @@ services:
     build: .
     container_name: server1
     hostname: server1
-    command: sh -c "make clean && make && ./servidor 8080 1 2 172.20.0.11 8080 3 172.20.0.12 8080"
+    command: sh -c "make && ./servidor 8080 1 2 172.20.0.11 8080 3 172.20.0.12 8080"
     volumes:
       - .:/app
     networks:
